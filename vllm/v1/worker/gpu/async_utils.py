@@ -12,11 +12,40 @@ from vllm.v1.worker.gpu.sample.output import SamplerOutput
 class AsyncOutput(AsyncModelRunnerOutput):
     def __init__(
         self,
+        max_num_reqs: int,
+        max_num_sampled: int,
+        main_stream: torch.cuda.Stream,
+        copy_stream: torch.cuda.Stream,
+    ):
+        self.main_stream = main_stream
+        self.copy_stream = copy_stream
+        self.copy_event = torch.cuda.Event()
+        self.sampled_token_ids_pinned = torch.empty(
+            max_num_reqs,
+            max_num_sampled,
+            dtype=torch.int64,
+            pin_memory=True,
+        )
+        self.sampled_token_ids_np = self.sampled_token_ids_pinned.numpy()
+        self.num_sampled_tokens_pinned = torch.empty(
+            max_num_reqs,
+            dtype=torch.int32,
+            pin_memory=True,
+        )
+        self.num_sampled_tokens_np = self.num_sampled_tokens_pinned.numpy()
+        self.num_nans_pinned = torch.empty(
+            max_num_reqs,
+            dtype=torch.int32,
+            pin_memory=True,
+        )
+        self.num_nans_np = self.num_nans_pinned.numpy()
+        self.has_num_nans: bool = False
+
+    def copy_outputs(
+        self,
         model_runner_output: ModelRunnerOutput,
         sampler_output: SamplerOutput,
         num_sampled_tokens: torch.Tensor,
-        main_stream: torch.cuda.Stream,
-        copy_stream: torch.cuda.Stream,
     ):
         # NOTE(woosuk): We must retain references to the GPU tensors,
         # as the copy operations are performed on a different CUDA stream than
@@ -24,26 +53,32 @@ class AsyncOutput(AsyncModelRunnerOutput):
         self.model_runner_output = model_runner_output
         self.sampler_output = sampler_output
         self.num_sampled_tokens = num_sampled_tokens
-        self.copy_event = torch.cuda.Event()
 
-        with stream(copy_stream, main_stream):
-            copy_stream.wait_stream(main_stream)
+        with stream(self.copy_stream, self.main_stream):
+            self.copy_stream.wait_stream(self.main_stream)
+            self.num_reqs = self.sampler_output.sampled_token_ids.shape[0]
+            self.sampled_token_ids_pinned[: self.num_reqs].copy_(
+                self.sampler_output.sampled_token_ids, non_blocking=True
+            )
+            self.num_sampled_tokens_pinned[: self.num_reqs].copy_(
+                self.num_sampled_tokens, non_blocking=True
+            )
+            self.has_num_nans = sampler_output.num_nans is not None
+            if self.has_num_nans:
+                self.num_nans_pinned[: self.num_reqs].copy_(
+                    sampler_output.num_nans, non_blocking=True
+                )
 
-            self.sampled_token_ids = async_copy_to_np(sampler_output.sampled_token_ids)
             self.logprobs_tensors: LogprobsTensors | None = None
             if sampler_output.logprobs_tensors is not None:
                 self.logprobs_tensors = (
                     sampler_output.logprobs_tensors.to_cpu_nonblocking()
                 )
-            self.num_nans: np.ndarray | None = None
-            if sampler_output.num_nans is not None:
-                self.num_nans = async_copy_to_np(sampler_output.num_nans)
-            self.num_sampled_tokens_np = async_copy_to_np(num_sampled_tokens)
             self.prompt_logprobs_dict = {
                 k: v.to_cpu_nonblocking() if v is not None else None
                 for k, v in self.model_runner_output.prompt_logprobs_dict.items()
             }
-            self.copy_event.record(copy_stream)
+            self.copy_event.record(self.copy_stream)
 
     def get_output(self) -> ModelRunnerOutput:
         self.copy_event.synchronize()
@@ -52,15 +87,22 @@ class AsyncOutput(AsyncModelRunnerOutput):
         # the existing model runner.
         # Going forward, we should keep the data structures as NumPy arrays
         # rather than Python lists.
-        sampled_token_ids: list[list[int]] = self.sampled_token_ids.tolist()
-        num_sampled_tokens: list[int] = self.num_sampled_tokens_np.tolist()
+        sampled_token_ids: list[list[int]] = self.sampled_token_ids_np[
+            : self.num_reqs
+        ].tolist()
+        num_sampled_tokens: list[int] = self.num_sampled_tokens_np[
+            : self.num_reqs
+        ].tolist()
         for token_ids, num_tokens in zip(sampled_token_ids, num_sampled_tokens):
             del token_ids[num_tokens:]
         self.model_runner_output.sampled_token_ids = sampled_token_ids
 
-        if self.num_nans is not None:
+        if self.has_num_nans:
             self.model_runner_output.num_nans_in_logits = dict(
-                zip(self.model_runner_output.req_ids, self.num_nans.tolist())
+                zip(
+                    self.model_runner_output.req_ids,
+                    self.num_nans_np[: self.num_reqs].tolist(),
+                )
             )
 
         if self.logprobs_tensors is not None:

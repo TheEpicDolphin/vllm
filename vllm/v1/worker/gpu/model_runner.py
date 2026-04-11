@@ -128,9 +128,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.max_num_reqs = self.scheduler_config.max_num_seqs
         self.is_encoder_decoder = self.model_config.is_encoder_decoder
 
-        self.use_async_scheduling = self.scheduler_config.async_scheduling
-        self.output_copy_stream = torch.cuda.Stream(self.device)
-
         # Pipeline parallelism.
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.is_first_pp_rank = get_pp_group().is_first_rank
@@ -238,6 +235,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Expert parallelism load balancer.
         self.eplb = EPLBController(self.parallel_config, self.device)
+
+        # Async scheduling state.
+        self.use_async_scheduling = self.scheduler_config.async_scheduling
+        output_copy_stream = torch.cuda.Stream(self.device)
+        self.async_output = AsyncOutput(
+            self.max_num_reqs,
+            self.num_speculative_steps + 1,
+            main_stream=self.main_stream,
+            copy_stream=output_copy_stream,
+        )
 
     def update_max_model_len(self, max_model_len: int) -> None:
         self.max_model_len = max_model_len
@@ -1179,12 +1186,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             prompt_logprobs_dict=prompt_logprobs_dict,  # type: ignore[arg-type]
             kv_connector_output=kv_connector_output,
         )
-        async_output = AsyncOutput(
-            model_runner_output=model_runner_output,
-            sampler_output=sampler_output,
-            num_sampled_tokens=num_sampled,
-            main_stream=self.main_stream,
-            copy_stream=self.output_copy_stream,
+
+        # Copy sample and model runner outputs to the async output.
+        self.async_output.copy_outputs(
+            model_runner_output,
+            sampler_output,
+            num_sampled,
         )
 
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None
@@ -1235,8 +1242,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.draft_tokens_handler.set_draft_tokens(input_batch, draft_tokens)
 
         if self.use_async_scheduling:
-            return async_output
-        return async_output.get_output()
+            return self.async_output
+        return self.async_output.get_output()
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         return self.draft_tokens_handler.get_draft_tokens()
