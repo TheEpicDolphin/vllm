@@ -689,6 +689,10 @@ class Worker(WorkerBase):
         # the model initialization and profiling.
         set_random_seed(self.model_config.seed)
 
+        ssd_comm = getattr(self.model_runner, "ssd_comm", None)
+        if ssd_comm is not None:
+            ssd_comm.enabled = True
+
         return self.compilation_config.compilation_time
 
     def reset_mm_cache(self) -> None:

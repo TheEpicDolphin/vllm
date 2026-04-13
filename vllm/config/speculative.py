@@ -195,6 +195,30 @@ class SpeculativeConfig:
     positions equals this value. Only used when rejection_sample_method
     is 'synthetic'. Must be in [0, 1]."""
 
+    enable_ssd: bool = False
+    """Enable Speculative Speculative Decoding (SSD). When enabled, one DP
+    rank is dedicated as the draft model speculator device. The speculator
+    generates K×K draft tokens per step (K continuations for each of K
+    draft positions), while the base model devices verify tokens in parallel.
+    Requires DP >= 2 (one rank for the speculator, the rest for base model).
+    Does NOT work with EAGLE/EAGLE-3 methods (requires standalone draft
+    model)."""
+
+    _ssd_dp_rank: int = 0
+    """(Runtime, set by engine core.) Original DP rank before the non-MoE
+    reset to DP=1.  Used to determine which rank acts as speculator."""
+
+    _ssd_dp_size: int = 1
+    """(Runtime, set by engine core.) Original DP size before the non-MoE
+    reset.  Used together with _ssd_dp_rank."""
+
+    _ssd_nccl_port: int = 0
+    """(Runtime, set by engine core.) TCP port for the stateless NCCL
+    process group that connects workers across DP engine-core processes."""
+
+    _ssd_master_ip: str = ""
+    """(Runtime, set by engine core.) Master IP for the SSD NCCL group."""
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,

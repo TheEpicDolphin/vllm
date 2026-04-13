@@ -1767,6 +1767,7 @@ class VllmConfig:
         if (
             self.speculative_config is not None
             and self.speculative_config.method not in ("eagle", "eagle3", "mtp")
+            and not self.speculative_config.enable_ssd
         ):
             unsupported.append(f"speculative method '{self.speculative_config.method}'")
 

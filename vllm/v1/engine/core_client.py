@@ -1343,20 +1343,31 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
 
         assert len(self.core_engines) > 1
 
+        # SSD dedicates the last DP rank as the speculator — exclude it
+        # from load balancing so no user requests are dispatched to it.
+        ssd_enabled = (
+            vllm_config.speculative_config is not None
+            and vllm_config.speculative_config.enable_ssd
+        )
+        self.num_lb_engines = (
+            len(self.core_engines) - 1 if ssd_enabled
+            else len(self.core_engines)
+        )
+
         self.eng_start_index = (
-            len(self.core_engines) * self.client_index
+            self.num_lb_engines * self.client_index
         ) // client_count
 
     def get_core_engine_for_request(self, request: EngineCoreRequest) -> EngineIdentity:
         # Engines are in rank order.
         if (eng_index := request.data_parallel_rank) is None and (
             eng_index := get_late_interaction_engine_index(
-                request.pooling_params, len(self.core_engines)
+                request.pooling_params, self.num_lb_engines
             )
         ) is None:
             current_counts = self.lb_engines
             # TODO use P2C alg for larger DP sizes
-            num_engines = len(current_counts)
+            num_engines = self.num_lb_engines
             min_score = sys.maxsize
             eng_index = 0
             for i in range(num_engines):

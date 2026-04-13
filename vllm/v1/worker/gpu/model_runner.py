@@ -162,11 +162,49 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.speculator = None
         self.num_speculative_steps = 0
         self.use_aux_hidden_state_outputs = False
+
+        # Speculative Speculative Decoding (SSD): the last DP rank is the
+        # dedicated speculator device.  Use the original (pre-reset) DP info
+        # stored in speculative_config by the engine core, since the non-MoE
+        # DP path resets data_parallel_size to 1 and data_parallel_rank to 0.
+        self.is_ssd_enabled = (
+            self.speculative_config is not None
+            and self.speculative_config.enable_ssd
+        )
+        self.is_ssd_speculator = (
+            self.is_ssd_enabled
+            and self.speculative_config._ssd_dp_rank
+            == self.speculative_config._ssd_dp_size - 1
+        )
+
         if self.speculative_config is not None:
             self.num_speculative_steps = self.speculative_config.num_speculative_tokens
 
+            if self.is_ssd_enabled:
+                from vllm.v1.worker.gpu.spec_decode.ssd.communicator import (
+                    SSDCommunicator,
+                )
+                self.ssd_comm: SSDCommunicator | None = SSDCommunicator(
+                    is_speculator=self.is_ssd_speculator,
+                    dp_size=self.speculative_config._ssd_dp_size,
+                    dp_rank=self.speculative_config._ssd_dp_rank,
+                    num_speculative_tokens=self.num_speculative_steps,
+                    max_num_reqs=self.max_num_reqs,
+                    device=self.device,
+                    master_ip=self.speculative_config._ssd_master_ip,
+                    nccl_port=self.speculative_config._ssd_nccl_port,
+                )
+                ssd_comm = self.ssd_comm
+            else:
+                self.ssd_comm = None
+                ssd_comm = None
+
             if self.is_last_pp_rank:
-                self.speculator = init_speculator(self.vllm_config, self.device)
+                self.speculator = init_speculator(
+                    self.vllm_config, self.device,
+                    ssd_comm=ssd_comm,
+                    is_ssd_speculator=self.is_ssd_speculator,
+                )
 
             if self.speculative_config.method == "eagle3":
                 # EAGLE3 may require auxiliary hidden states from target model outputs.
@@ -198,6 +236,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
 
         self.sampler: Sampler | None = None
+        # May be RejectionSampler or SSDRejectionSampler when SSD is enabled.
         self.rejection_sampler: RejectionSampler | None = None
         self.prompt_logprobs_worker: PromptLogprobsWorker | None = None
         self.structured_outputs_worker: StructuredOutputsWorker | None = None
@@ -214,10 +253,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 num_speculative_tokens=self.num_speculative_steps + 1,
             )
             if self.speculative_config is not None:
-                self.rejection_sampler = RejectionSampler(
-                    self.sampler,
-                    self.speculative_config,
-                )
+                if self.is_ssd_enabled:
+                    from vllm.v1.worker.gpu.spec_decode.ssd.rejection_sampler import (
+                        SSDRejectionSampler,
+                    )
+                    self.rejection_sampler = SSDRejectionSampler(
+                        self.sampler,
+                        self.speculative_config,
+                        is_speculator=self.is_ssd_speculator,
+                        ssd_comm=ssd_comm,
+                    )
+                else:
+                    self.rejection_sampler = RejectionSampler(
+                        self.sampler,
+                        self.speculative_config,
+                    )
             self.prompt_logprobs_worker = PromptLogprobsWorker(self.max_num_reqs)
             self.structured_outputs_worker = StructuredOutputsWorker(
                 max_num_logits=self.max_num_reqs * (self.num_speculative_steps + 1),
@@ -291,7 +341,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         if not load_dummy_weights:
             prepare_communication_buffer_for_model(self.model)
-            if self.speculator is not None:
+            if self.speculator is not None and self.speculator.model is not None:
                 prepare_communication_buffer_for_model(self.speculator.model)
 
         # Initialize the components that require the model.
@@ -941,6 +991,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.update_requests(scheduler_output)
             self.block_tables.apply_staged_writes()
             if scheduler_output.total_num_scheduled_tokens == 0:
+                if self.is_ssd_enabled:
+                    # SSD with 0 tokens (speculator always, base sometimes):
+                    # produce a dummy state so sample_tokens can still perform
+                    # the NCCL sync via the rejection sampler.
+                    self.execute_model_state = ExecuteModelState(
+                        input_batch=None,
+                        attn_metadata=None,
+                        slot_mappings_by_layer=None,
+                        hidden_states=torch.empty(
+                            0, dtype=self.dtype, device=self.device),
+                        aux_hidden_states=None,
+                        kv_connector_output=None,
+                        num_tokens_across_dp=None,
+                    )
+                    return None
                 # No need to run the model.
                 empty_output = self.kv_connector.no_forward(scheduler_output)
                 return empty_output
@@ -1128,6 +1193,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.execute_model_state is None:
             # The prior execute_model call must have failed.
             return None
+
+        # SSD with no scheduled tokens (speculator always, base sometimes):
+        # perform NCCL sync via the rejection sampler so the speculator
+        # doesn't deadlock. Skip when communication is disabled (warmup).
+        if self.is_ssd_enabled and self.execute_model_state.input_batch is None:
+            self.execute_model_state = None
+            if self.ssd_comm is not None and self.ssd_comm.enabled:
+                assert self.rejection_sampler is not None
+                dummy = torch.empty(0, dtype=self.dtype, device=self.device)
+                self.rejection_sampler(dummy, None)
+            return ModelRunnerOutput(
+                req_ids=[], req_id_to_index={},
+                sampled_token_ids=None, prompt_logprobs_dict={},
+                kv_connector_output=None,
+            )
 
         input_batch = self.execute_model_state.input_batch
         attn_metadata = self.execute_model_state.attn_metadata

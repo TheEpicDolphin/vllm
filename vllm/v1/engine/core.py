@@ -151,6 +151,15 @@ class EngineCore:
             block_size=scheduler_block_size,
         )
         self.use_spec_decode = vllm_config.speculative_config is not None
+        self.is_ssd_enabled = (
+            vllm_config.speculative_config is not None
+            and vllm_config.speculative_config.enable_ssd
+        )
+        self.is_ssd_speculator = (
+            self.is_ssd_enabled
+            and vllm_config.speculative_config._ssd_dp_rank
+            == vllm_config.speculative_config._ssd_dp_size - 1
+        )
         if self.scheduler.connector is not None:  # type: ignore
             self.model_executor.init_kv_output_aggregator(self.scheduler.connector)  # type: ignore
 
@@ -386,9 +395,16 @@ class EngineCore:
         was executed.
         """
 
+        if self.is_ssd_speculator:
+            return self._ssd_speculator_step()
+
         # Check for any requests remaining in the scheduler - unfinished,
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
+            if self.is_ssd_enabled:
+                # SSD base must still step to participate in NCCL sync
+                # even with no requests, to avoid deadlocking the speculator.
+                return self._ssd_base_empty_step()
             return {}, False
         scheduler_output = self.scheduler.schedule()
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
@@ -409,6 +425,29 @@ class EngineCore:
         )
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
+
+    def _ssd_speculator_step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
+        """SSD speculator step: participate in NCCL sync with base instances.
+
+        The speculator doesn't serve user requests. It calls execute_model
+        (which is a no-op) and sample_tokens (which does NCCL sync + K×K
+        generation) to stay in lockstep with base instances.
+        """
+        scheduler_output = self.scheduler.schedule()
+        future = self.model_executor.execute_model(scheduler_output, non_block=True)
+        model_output = future.result()
+        if model_output is None:
+            model_output = self.model_executor.sample_tokens(None)
+        return {}, True
+
+    def _ssd_base_empty_step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
+        """SSD base step with no requests: participate in NCCL sync."""
+        scheduler_output = self.scheduler.schedule()
+        future = self.model_executor.execute_model(scheduler_output, non_block=True)
+        model_output = future.result()
+        if model_output is None:
+            model_output = self.model_executor.sample_tokens(None)
+        return {}, False
 
     def post_step(self, model_executed: bool) -> None:
         # When using async scheduling we can't get draft token ids in advance,
@@ -1070,6 +1109,18 @@ class EngineCoreProc(EngineCore):
                 )
 
             parallel_config.data_parallel_index = dp_rank
+
+            ssd_enabled = (
+                vllm_config.speculative_config is not None
+                and vllm_config.speculative_config.enable_ssd
+            )
+            if ssd_enabled:
+                spec_cfg = vllm_config.speculative_config
+                spec_cfg._ssd_dp_rank = dp_rank
+                spec_cfg._ssd_dp_size = parallel_config.data_parallel_size
+                spec_cfg._ssd_master_ip = parallel_config.data_parallel_master_ip
+                spec_cfg._ssd_nccl_port = parallel_config.get_next_dp_init_port()
+
             if data_parallel and vllm_config.model_config.is_moe:
                 # Set data parallel rank for this engine process.
                 parallel_config.data_parallel_rank = dp_rank
@@ -1125,6 +1176,10 @@ class EngineCoreProc(EngineCore):
 
     def has_work(self) -> bool:
         """Returns true if the engine should be stepped."""
+        if self.is_ssd_enabled:
+            # All SSD engines (both base and speculator) must always step
+            # to participate in NCCL sync and avoid deadlocks.
+            return True
         return (
             self.engines_running
             or self.scheduler.has_requests()
