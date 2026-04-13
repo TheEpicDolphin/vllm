@@ -20,6 +20,7 @@ The stateless PG is NOT registered in PyTorch's _world.pg_map, so we
 must use the low-level ``group.send`` / ``group.recv`` methods instead
 of ``torch.distributed.send`` / ``torch.distributed.recv``.
 """
+
 from __future__ import annotations
 
 import torch
@@ -72,32 +73,43 @@ class SSDCommunicator:
             ]
             self.send_draft_tokens = [
                 torch.zeros(
-                    max_num_reqs, self.K, self.K,
-                    dtype=torch.int64, device=device,
+                    max_num_reqs,
+                    self.K,
+                    self.K,
+                    dtype=torch.int64,
+                    device=device,
                 )
                 for _ in range(self.num_base_ranks)
             ]
             self._last_num_reqs: list[int] = [0] * self.num_base_ranks
         else:
             self.send_num_reqs = torch.zeros(
-                1, dtype=torch.int32, device=device,
+                1,
+                dtype=torch.int32,
+                device=device,
             )
             self.send_num_accepted = torch.zeros(
-                max_num_reqs, dtype=torch.int32, device=device,
+                max_num_reqs,
+                dtype=torch.int32,
+                device=device,
             )
             self.recv_draft_tokens = torch.zeros(
-                max_num_reqs, self.K, self.K,
-                dtype=torch.int64, device=device,
+                max_num_reqs,
+                self.K,
+                self.K,
+                dtype=torch.int64,
+                device=device,
             )
 
         # Create NCCL group eagerly — both engine-core workers construct
         # the communicator at roughly the same time during model loading,
         # so the TCP rendezvous succeeds within the default timeout.
         logger.info(
-            "SSD: creating stateless NCCL group "
-            "(rank=%d, world=%d, ip=%s, port=%d)",
-            self.dp_rank, self.dp_size,
-            self._master_ip, self._nccl_port,
+            "SSD: creating stateless NCCL group (rank=%d, world=%d, ip=%s, port=%d)",
+            self.dp_rank,
+            self.dp_size,
+            self._master_ip,
+            self._nccl_port,
         )
         self._ssd_pg: dist.ProcessGroup = (
             stateless_init_torch_distributed_process_group(
@@ -141,8 +153,7 @@ class SSDCommunicator:
 
         if num_reqs > 0:
             self.send_num_accepted[:num_reqs].copy_(num_accepted[:num_reqs])
-            self._send(self.send_num_accepted[:num_reqs],
-                       self.speculator_dp_rank)
+            self._send(self.send_num_accepted[:num_reqs], self.speculator_dp_rank)
 
     def speculator_recv_accepted(
         self,
@@ -160,10 +171,12 @@ class SSDCommunicator:
                     base_dp_rank,
                 )
 
-            results.append((
-                self.recv_num_accepted[base_dp_rank],
-                num_reqs,
-            ))
+            results.append(
+                (
+                    self.recv_num_accepted[base_dp_rank],
+                    num_reqs,
+                )
+            )
         return results
 
     # ------------------------------------------------------------------
@@ -222,8 +235,10 @@ class SSDCommunicator:
         draft_tokens_per_base: list[torch.Tensor | None],
     ) -> list[tuple[torch.Tensor, int]]:
         results = self.speculator_recv_accepted()
-        draft = (draft_tokens_per_base[0]
-                 if draft_tokens_per_base and draft_tokens_per_base[0] is not None
-                 else None)
+        draft = (
+            draft_tokens_per_base[0]
+            if draft_tokens_per_base and draft_tokens_per_base[0] is not None
+            else None
+        )
         self.speculator_send_drafts(draft)
         return results

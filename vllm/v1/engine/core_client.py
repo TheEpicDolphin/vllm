@@ -1350,13 +1350,10 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             and vllm_config.speculative_config.enable_ssd
         )
         self.num_lb_engines = (
-            len(self.core_engines) - 1 if ssd_enabled
-            else len(self.core_engines)
+            len(self.core_engines) - 1 if ssd_enabled else len(self.core_engines)
         )
 
-        self.eng_start_index = (
-            self.num_lb_engines * self.client_index
-        ) // client_count
+        self.eng_start_index = (self.num_lb_engines * self.client_index) // client_count
 
     def get_core_engine_for_request(self, request: EngineCoreRequest) -> EngineIdentity:
         # Engines are in rank order.

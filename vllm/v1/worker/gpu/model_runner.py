@@ -168,8 +168,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # stored in speculative_config by the engine core, since the non-MoE
         # DP path resets data_parallel_size to 1 and data_parallel_rank to 0.
         self.is_ssd_enabled = (
-            self.speculative_config is not None
-            and self.speculative_config.enable_ssd
+            self.speculative_config is not None and self.speculative_config.enable_ssd
         )
         self.is_ssd_speculator = (
             self.is_ssd_enabled
@@ -184,6 +183,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 from vllm.v1.worker.gpu.spec_decode.ssd.communicator import (
                     SSDCommunicator,
                 )
+
                 self.ssd_comm: SSDCommunicator | None = SSDCommunicator(
                     is_speculator=self.is_ssd_speculator,
                     dp_size=self.speculative_config._ssd_dp_size,
@@ -201,7 +201,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
             if self.is_last_pp_rank:
                 self.speculator = init_speculator(
-                    self.vllm_config, self.device,
+                    self.vllm_config,
+                    self.device,
                     ssd_comm=ssd_comm,
                     is_ssd_speculator=self.is_ssd_speculator,
                 )
@@ -257,6 +258,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     from vllm.v1.worker.gpu.spec_decode.ssd.rejection_sampler import (
                         SSDRejectionSampler,
                     )
+
                     self.rejection_sampler = SSDRejectionSampler(
                         self.sampler,
                         self.speculative_config,
@@ -1000,7 +1002,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         attn_metadata=None,
                         slot_mappings_by_layer=None,
                         hidden_states=torch.empty(
-                            0, dtype=self.dtype, device=self.device),
+                            0, dtype=self.dtype, device=self.device
+                        ),
                         aux_hidden_states=None,
                         kv_connector_output=None,
                         num_tokens_across_dp=None,
@@ -1204,8 +1207,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 dummy = torch.empty(0, dtype=self.dtype, device=self.device)
                 self.rejection_sampler(dummy, None)
             return ModelRunnerOutput(
-                req_ids=[], req_id_to_index={},
-                sampled_token_ids=None, prompt_logprobs_dict={},
+                req_ids=[],
+                req_id_to_index={},
+                sampled_token_ids=None,
+                prompt_logprobs_dict={},
                 kv_connector_output=None,
             )
 

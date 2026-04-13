@@ -5,8 +5,12 @@ import torch
 from vllm.config import VllmConfig
 
 
-def init_speculator(vllm_config: VllmConfig, device: torch.device,
-                    ssd_comm=None, is_ssd_speculator: bool = False):
+def init_speculator(
+    vllm_config: VllmConfig,
+    device: torch.device,
+    ssd_comm=None,
+    is_ssd_speculator: bool = False,
+):
     speculative_config = vllm_config.speculative_config
     assert speculative_config is not None
 
@@ -15,7 +19,8 @@ def init_speculator(vllm_config: VllmConfig, device: torch.device,
         from vllm.v1.worker.gpu.spec_decode.ssd.speculator import SSDSpeculator
 
         return SSDSpeculator(
-            vllm_config, device,
+            vllm_config,
+            device,
             is_speculator=is_ssd_speculator,
             ssd_comm=ssd_comm,
         )

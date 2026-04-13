@@ -19,6 +19,7 @@ The draft model must be a standalone autoregressive model (e.g.
 Llama-3.2-1B).  EAGLE/EAGLE-3 methods are NOT supported because they
 require hidden states from the base model.
 """
+
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
@@ -46,6 +47,7 @@ if TYPE_CHECKING:
     )
 
 logger = init_logger(__name__)
+
 
 @triton.jit
 def _update_draft_inputs_kernel(
@@ -157,24 +159,35 @@ class SSDSpeculator:
 
         # K×K draft tokens: [max_num_reqs, K, K]
         self.draft_tokens = torch.zeros(
-            self.max_num_reqs, self.K, self.K,
-            dtype=torch.int64, device=device,
+            self.max_num_reqs,
+            self.K,
+            self.K,
+            dtype=torch.int64,
+            device=device,
         )
 
         # Primary draft tokens from the previous round: [max_num_reqs, K]
         self.primary_draft_tokens = torch.zeros(
-            self.max_num_reqs, self.K,
-            dtype=torch.int64, device=device,
+            self.max_num_reqs,
+            self.K,
+            dtype=torch.int64,
+            device=device,
         )
 
         self.temperature = torch.zeros(
-            self.max_num_reqs, dtype=torch.float32, device=device,
+            self.max_num_reqs,
+            dtype=torch.float32,
+            device=device,
         )
         self.seeds = torch.zeros(
-            self.max_num_reqs, dtype=torch.int64, device=device,
+            self.max_num_reqs,
+            dtype=torch.int64,
+            device=device,
         )
         self.idx_mapping = torch.zeros(
-            self.max_num_reqs, dtype=torch.int32, device=device,
+            self.max_num_reqs,
+            dtype=torch.int32,
+            device=device,
         )
 
         self.model: nn.Module | None = None
@@ -348,8 +361,12 @@ class SSDSpeculator:
 
         if self.is_speculator:
             self._propose_speculator(
-                input_batch, attn_metadata, slot_mappings,
-                num_tokens_across_dp, temperature, seeds,
+                input_batch,
+                attn_metadata,
+                slot_mappings,
+                num_tokens_across_dp,
+                temperature,
+                seeds,
             )
         else:
             return self._propose_base(input_batch, num_sampled)
@@ -378,7 +395,9 @@ class SSDSpeculator:
 
         # Draft prefill.
         last_hidden_states = self.run_model(
-            num_tokens, attn_metadata, slot_mappings,
+            num_tokens,
+            attn_metadata,
+            slot_mappings,
             num_tokens_across_dp=num_tokens_across_dp,
         )
         sample_hidden_states = last_hidden_states[input_batch.logits_indices]
@@ -386,10 +405,14 @@ class SSDSpeculator:
 
         positions = input_batch.positions[input_batch.logits_indices]
         self.draft_tokens[:num_reqs, 0, 0] = gumbel_sample(
-            logits, idx_mapping, self.temperature, self.seeds,
-            positions + 1, apply_temperature=True,
+            logits,
+            idx_mapping,
+            self.temperature,
+            self.seeds,
+            positions + 1,
+            apply_temperature=True,
         )
-        
+
         # Round i
         # Base
         # d0 - d1 - d2 - d3
@@ -485,13 +508,17 @@ class SSDSpeculator:
 
         # Select the K continuations from the last accepted position.
         accepted_pos = torch.clamp(
-            num_sampled[:num_reqs] - 1, min=0, max=K - 1,
+            num_sampled[:num_reqs] - 1,
+            min=0,
+            max=K - 1,
         )
         accepted_pos_expanded = (
             accepted_pos.long().unsqueeze(1).unsqueeze(2).expand(-1, 1, K)
         )
         selected = torch.gather(
-            kxk_draft_tokens[:num_reqs], dim=1, index=accepted_pos_expanded,
+            kxk_draft_tokens[:num_reqs],
+            dim=1,
+            index=accepted_pos_expanded,
         ).squeeze(1)  # [num_reqs, K]
 
         return selected

@@ -12,6 +12,7 @@ identically to non-SSD speculative decoding. When the base has no requests
 (input_batch is None), handles the empty NCCL sync so the speculator doesn't
 deadlock.
 """
+
 from __future__ import annotations
 
 import torch
@@ -76,11 +77,11 @@ class SSDRejectionSampler:
                 K = self.num_speculative_steps
                 return SamplerOutput(
                     sampled_token_ids=torch.zeros(
-                        0, K + 1, dtype=torch.int64, device=logits.device),
+                        0, K + 1, dtype=torch.int64, device=logits.device
+                    ),
                     logprobs_tensors=None,
                     num_nans=None,
-                    num_sampled=torch.zeros(
-                        0, dtype=torch.int32, device=logits.device),
+                    num_sampled=torch.zeros(0, dtype=torch.int32, device=logits.device),
                 )
             assert self.rejection_sampler is not None
             return self.rejection_sampler(logits, input_batch, draft_logits)
@@ -90,24 +91,20 @@ class SSDRejectionSampler:
         # to know what the bases accepted so propose() can act on it.
         self.last_base_results = self.ssd_comm.speculator_recv_accepted()
 
-        for base_dp_rank, (num_accepted, num_reqs) in enumerate(
-            self.last_base_results
-        ):
+        for base_dp_rank, (num_accepted, num_reqs) in enumerate(self.last_base_results):
             if num_reqs > 0:
                 logger.debug(
-                    "SSD speculator: base dp_rank=%d, num_reqs=%d, "
-                    "avg_accepted=%.1f",
-                    base_dp_rank, num_reqs,
+                    "SSD speculator: base dp_rank=%d, num_reqs=%d, avg_accepted=%.1f",
+                    base_dp_rank,
+                    num_reqs,
                     num_accepted[:num_reqs].float().mean().item(),
                 )
 
         # Return a dummy SamplerOutput. The speculator doesn't produce
         # user-facing tokens — it only generates drafts.
         K = self.num_speculative_steps
-        dummy_sampled = torch.zeros(0, K + 1, dtype=torch.int64,
-                                    device=logits.device)
-        dummy_num_sampled = torch.zeros(0, dtype=torch.int32,
-                                        device=logits.device)
+        dummy_sampled = torch.zeros(0, K + 1, dtype=torch.int64, device=logits.device)
+        dummy_num_sampled = torch.zeros(0, dtype=torch.int32, device=logits.device)
         return SamplerOutput(
             sampled_token_ids=dummy_sampled,
             logprobs_tensors=None,
