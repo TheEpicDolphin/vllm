@@ -84,6 +84,9 @@ class EagleSpeculator:
         self.last_token_indices = torch.zeros(
             self.max_num_reqs, dtype=torch.int64, device=device
         )
+        self.arange_cpu = torch.arange(
+            self.max_num_reqs, dtype=torch.int32, device="cpu"
+        )
 
         self.supports_mm_inputs = MULTIMODAL_REGISTRY.supports_multimodal_inputs(
             self.draft_model_config
@@ -310,22 +313,16 @@ class EagleSpeculator:
                         idx_mapping, query_start_loc, pos, num_tokens_padded
                     )
 
-    def _build_draft_attn_metadata(
+    def _build_attn_metadata(
         self,
-        num_reqs: int,
         num_reqs_padded: int,
         num_tokens_padded: int,
         max_query_len: int,
+        query_start_loc_cpu: torch.Tensor,
     ) -> dict[str, Any] | None:
         if not self.draft_attn_layer_names:
             return None
 
-        query_start_loc_cpu = (
-            torch.arange(num_reqs_padded + 1, dtype=torch.int32, device="cpu").clamp_(
-                max=num_reqs
-            )
-            * max_query_len
-        )
         block_tables = [
             x[:num_reqs_padded] for x in self.block_tables.input_block_tables
         ]
@@ -469,27 +466,38 @@ class EagleSpeculator:
             need_eager=is_profile,
         )
 
-        if prefill_batch_desc.cg_mode == CUDAGraphMode.FULL:
-            # It is necessary to rebuild the attention metadata when
-            # replaying the FULL graph so that any attention metadata
-            # builder state is updated.
-            self._build_draft_attn_metadata(
-                num_reqs=num_reqs,
-                num_reqs_padded=prefill_batch_desc.num_reqs or num_reqs,
+        prefill_attn_metadata = None
+        if not (dummy_run and skip_attn_for_dummy_run):
+            # Build attention metadata for draft prefill.
+            # NOTE: The target model's attention metadata cannot be reused
+            # here because the draft model's layer(s) are in a separate
+            # attention group, and thus must be built with the associated
+            # attention metadata builder.
+            num_reqs_padded = prefill_batch_desc.num_reqs or num_reqs
+            if num_reqs_padded > num_reqs:
+                # FULL cuda graph (uniform batch).
+                query_start_loc_cpu = (
+                    torch.clamp(self.arange_cpu[: num_reqs_padded + 1], max=num_reqs)
+                    * max_query_len
+                )
+            else:
+                query_start_loc_cpu = torch.from_numpy(input_batch.query_start_loc_np)
+            prefill_attn_metadata = self._build_attn_metadata(
+                num_reqs_padded=num_reqs_padded,
                 num_tokens_padded=prefill_batch_desc.num_tokens,
-                max_query_len=self.num_speculative_steps + 1,
+                max_query_len=max_query_len,
+                query_start_loc_cpu=query_start_loc_cpu,
             )
+
+        if prefill_batch_desc.cg_mode == CUDAGraphMode.FULL:
             # Replay the full graph for draft prefill.
             assert self.prefill_cudagraph_manager is not None
             self.prefill_cudagraph_manager.run_fullgraph(prefill_batch_desc)
         else:
-            # The target model's attention metadata and slot mappings
-            # can directly be used for draft prefill, because of the
-            # identical batch shape and KV cache layout.
             self.prefill(
                 num_reqs,
                 prefill_batch_desc.num_tokens,
-                attn_metadata,
+                prefill_attn_metadata,
                 slot_mappings,
                 num_tokens_across_dp=num_tokens_across_dp,
                 cudagraph_runtime_mode=prefill_batch_desc.cg_mode,
@@ -522,8 +530,8 @@ class EagleSpeculator:
             need_eager=is_profile,
         )
 
-        attn_metadata_updated = None
-        slot_mappings_updated = None
+        decode_attn_metadata = None
+        decode_slot_mappings = None
         if not (dummy_run and skip_attn_for_dummy_run):
             # Build attention metadata and slot mappings for the draft
             # decode steps. It is necessary to rebuild the attention
@@ -535,14 +543,18 @@ class EagleSpeculator:
                 self.input_buffers.positions[:num_reqs],
                 decode_batch_desc.num_tokens,
             )
-            slot_mappings_updated = build_slot_mappings_by_layer(
+            decode_slot_mappings = build_slot_mappings_by_layer(
                 slot_mappings, self.kv_cache_config
             )
-            attn_metadata_updated = self._build_draft_attn_metadata(
-                num_reqs=num_reqs,
-                num_reqs_padded=decode_batch_desc.num_reqs or num_reqs,
+            num_reqs_padded = decode_batch_desc.num_reqs or num_reqs
+            query_start_loc_cpu = torch.clamp(
+                self.arange_cpu[: num_reqs_padded + 1], max=num_reqs
+            )
+            decode_attn_metadata = self._build_attn_metadata(
+                num_reqs_padded=num_reqs_padded,
                 num_tokens_padded=decode_batch_desc.num_tokens,
                 max_query_len=1,
+                query_start_loc_cpu=query_start_loc_cpu,
             )
 
         if decode_batch_desc.cg_mode == CUDAGraphMode.FULL:
@@ -553,8 +565,8 @@ class EagleSpeculator:
             self.generate_draft(
                 num_reqs,
                 decode_batch_desc.num_tokens,
-                attn_metadata_updated,
-                slot_mappings_updated,
+                decode_attn_metadata,
+                decode_slot_mappings,
                 num_tokens_across_dp=num_tokens_across_dp,
                 cudagraph_runtime_mode=decode_batch_desc.cg_mode,
             )
