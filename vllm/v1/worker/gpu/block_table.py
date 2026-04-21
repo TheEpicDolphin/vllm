@@ -210,6 +210,39 @@ def _gather_block_tables_kernel(
 
 
 @triton.jit
+def _compute_slot_id(
+    position,
+    req_state_idx,
+    block_table_ptr,
+    block_table_stride,
+    block_size,
+    cp_rank,
+    CP_SIZE: tl.constexpr,
+    CP_INTERLEAVE: tl.constexpr,
+    PAD_ID: tl.constexpr,
+):
+    """Compute slot ID(s) for one or more positions within a single KV cache
+    group.  Works for both scalar positions (eagle decode, 1 token per
+    request) and vectorized positions (general prefill/decode)."""
+    block_index = position // (block_size * CP_SIZE)
+    block_offset = position % (block_size * CP_SIZE)
+    block_number = tl.load(
+        block_table_ptr + req_state_idx * block_table_stride + block_index
+    )
+    if CP_SIZE == 1:
+        # Common case: Context parallelism is not used.
+        return block_number * block_size + block_offset
+    else:
+        # Context parallelism is used.
+        is_local = block_offset // CP_INTERLEAVE % CP_SIZE == cp_rank
+        rounds = block_offset // (CP_INTERLEAVE * CP_SIZE)
+        remainder = block_offset % CP_INTERLEAVE
+        local_offset = rounds * CP_INTERLEAVE + remainder
+        slot_id = block_number * block_size + local_offset
+        return tl.where(is_local, slot_id, PAD_ID)
+
+
+@triton.jit
 def _compute_slot_mappings_kernel(
     max_num_tokens,
     idx_mapping,  # [num_reqs]
@@ -252,25 +285,17 @@ def _compute_slot_mappings_kernel(
     for i in range(start_idx, end_idx, TRITON_BLOCK_SIZE):
         offset = i + tl.arange(0, TRITON_BLOCK_SIZE)
         positions = tl.load(pos + offset, mask=offset < end_idx, other=0)
-
-        block_indices = positions // (block_size * CP_SIZE)
-        block_offsets = positions % (block_size * CP_SIZE)
-        block_numbers = tl.load(
-            block_table_ptr + req_state_idx * block_table_stride + block_indices
+        slot_ids = _compute_slot_id(
+            positions,
+            req_state_idx,
+            block_table_ptr,
+            block_table_stride,
+            block_size,
+            cp_rank,
+            CP_SIZE,
+            CP_INTERLEAVE,
+            PAD_ID,
         )
-
-        if CP_SIZE == 1:
-            # Common case: Context parallelism is not used.
-            slot_ids = block_numbers * block_size + block_offsets
-        else:
-            # Context parallelism is used.
-            is_local = block_offsets // CP_INTERLEAVE % CP_SIZE == cp_rank
-            rounds = block_offsets // (CP_INTERLEAVE * CP_SIZE)
-            remainder = block_offsets % CP_INTERLEAVE
-            local_offsets = rounds * CP_INTERLEAVE + remainder
-            slot_ids = block_numbers * block_size + local_offsets
-            slot_ids = tl.where(is_local, slot_ids, PAD_ID)
-
         tl.store(slot_mapping_ptr + offset, slot_ids, mask=offset < end_idx)
 
 
