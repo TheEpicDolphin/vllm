@@ -71,6 +71,7 @@ class EagleSpeculator:
             device=device,
         )
         self.decode_input_buffers: InputBuffers | None = None
+        self.decode_slot_mappings: torch.Tensor | None = None
         if self.num_speculative_steps > 1:
             # Decode input buffers are only needed when drafting more
             # than one token.
@@ -182,6 +183,17 @@ class EagleSpeculator:
         )
         self.block_tables = block_tables
 
+        # Dedicated slot mappings tensor for decode steps so that writing
+        # decode slot mappings in the fused kernel doesn't corrupt the
+        # shared block_tables.slot_mappings used by the prefill attention.
+        if self.num_speculative_steps > 1:
+            self.decode_slot_mappings = torch.full(
+                block_tables.slot_mappings.shape,
+                PAD_SLOT_ID,
+                dtype=torch.int64,
+                device=self.device,
+            )
+
     @torch.inference_mode()
     def run_model(
         self,
@@ -205,6 +217,7 @@ class EagleSpeculator:
         ):
             inputs_embeds = None
             if self.supports_mm_inputs:
+                # Merge multimodal embeddings with input ids.
                 mm_embeds, is_mm_embed = mm_inputs or (None, None)
                 num_input_tokens = (
                     is_mm_embed.shape[0] if is_mm_embed is not None else num_tokens
@@ -311,7 +324,8 @@ class EagleSpeculator:
             self.draft_tokens[:num_reqs, step] = draft_tokens
 
             if step < self.num_speculative_steps - 1:
-                update_eagle_draft_inputs(
+                # Update the inputs for the next step.
+                update_eagle_decode_inputs(
                     draft_tokens,
                     hidden_states,
                     self.decode_input_buffers,
@@ -466,6 +480,7 @@ class EagleSpeculator:
             last_sampled,
             next_prefill_tokens,
             self.block_tables if not (dummy_run and skip_attn_for_dummy_run) else None,
+            self.decode_slot_mappings,
             self.max_model_len,
             self.max_num_reqs,
             self.num_speculative_steps,
@@ -536,17 +551,22 @@ class EagleSpeculator:
         attn_metadata_updated = None
         slot_mappings_updated = None
         if not (dummy_run and skip_attn_for_dummy_run):
-            # Slot mappings for the first decode step were already computed
-            # by the fused kernel. Build the per-layer dict and attention
-            # metadata from the pre-populated block_tables.slot_mappings.
+            assert self.decode_slot_mappings is not None
+            # Copy decode slot mappings (computed by the fused kernel into
+            # a dedicated buffer) back into block_tables.slot_mappings now
+            # that the prefill is done and no longer reading from it.
+            num_decode_tokens = decode_batch_desc.num_tokens
+            self.block_tables.slot_mappings[:, :num_decode_tokens].copy_(
+                self.decode_slot_mappings[:, :num_decode_tokens]
+            )
             slot_mappings_updated = build_slot_mappings_by_layer(
-                self.block_tables.slot_mappings[:, : decode_batch_desc.num_tokens],
+                self.block_tables.slot_mappings[:, :num_decode_tokens],
                 self.kv_cache_config,
             )
             attn_metadata_updated = self._build_draft_attn_metadata(
                 num_reqs=num_reqs,
                 num_reqs_padded=decode_batch_desc.num_reqs or num_reqs,
-                num_tokens_padded=decode_batch_desc.num_tokens,
+                num_tokens_padded=num_decode_tokens,
                 max_query_len=1,
                 input_buffers=self.decode_input_buffers,
             )
@@ -777,38 +797,27 @@ def _get_block_table_args(
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
-    torch.Tensor,
-    int,
     int,
     int,
     int,
     int,
 ]:
     if block_tables is None:
-        # Return dummy values.
         return (
-            # slot_mappings
-            torch.zeros(1, dtype=torch.int64, device=device),
-            # block_table_ptrs
             torch.zeros(1, dtype=torch.uint64, device=device),
-            # block_table_strides
             torch.zeros(1, dtype=torch.int64, device=device),
-            # block_sizes
             torch.zeros(1, dtype=torch.int32, device=device),
             0,  # num_kv_cache_groups
             0,  # cp_rank
-            0,  # max_num_batched_tokens
             1,  # cp_size
             1,  # cp_interleave
         )
 
     return (
-        block_tables.slot_mappings,
         block_tables.block_table_ptrs,
         block_tables.block_table_strides,
         block_tables.block_sizes_tensor,
         block_tables.num_kv_cache_groups,
-        block_tables.max_num_batched_tokens,
         block_tables.cp_rank,
         block_tables.cp_size,
         block_tables.cp_interleave,
@@ -830,6 +839,7 @@ def prepare_eagle_inputs(
     last_sampled: torch.Tensor,
     next_prefill_tokens: torch.Tensor,
     block_tables: BlockTables | None,
+    decode_slot_mappings: torch.Tensor | None,
     max_model_len: int,
     max_num_reqs: int,
     num_speculative_steps: int,
@@ -837,12 +847,10 @@ def prepare_eagle_inputs(
     num_reqs = input_batch.num_reqs
 
     (
-        slot_mappings,
         block_table_ptrs,
         block_table_strides,
         block_sizes,
         num_kv_cache_groups,
-        max_num_batched_tokens,
         cp_rank,
         cp_size,
         cp_interleave,
@@ -852,6 +860,11 @@ def prepare_eagle_inputs(
     # the decode path is compiled out, so these pointers are never
     # accessed. The prefill buffers are used as safe dummies.
     decode_buffers = decode_input_buffers or prefill_input_buffers
+    if decode_slot_mappings is None:
+        decode_slot_mappings = torch.zeros(
+            1, dtype=torch.int64, device=idx_mapping.device
+        )
+    max_num_batched_tokens = decode_slot_mappings.shape[-1]
 
     _prepare_eagle_inputs_kernel[(num_reqs,)](
         last_token_indices,
@@ -862,8 +875,8 @@ def prepare_eagle_inputs(
         decode_buffers.positions,
         decode_buffers.query_start_loc,
         decode_buffers.seq_lens,
-        slot_mappings,
-        slot_mappings.stride(0),
+        decode_slot_mappings,
+        decode_slot_mappings.stride(0),
         idx_mapping,
         temperature,
         seeds,
@@ -896,7 +909,7 @@ def prepare_eagle_inputs(
 
 
 @triton.jit
-def _update_eagle_draft_inputs_kernel(
+def _update_eagle_decode_inputs_kernel(
     input_ids_ptr,
     positions_ptr,
     input_hidden_states_ptr,
@@ -971,7 +984,7 @@ def _update_eagle_draft_inputs_kernel(
     )
 
 
-def update_eagle_draft_inputs(
+def update_eagle_decode_inputs(
     draft_tokens: torch.Tensor,
     output_hidden_states: torch.Tensor,
     input_buffers: InputBuffers,
@@ -983,18 +996,21 @@ def update_eagle_draft_inputs(
     num_reqs, hidden_size = output_hidden_states.shape
 
     (
-        slot_mappings,
         block_table_ptrs,
         block_table_strides,
         block_sizes,
         num_kv_cache_groups,
-        _,
         cp_rank,
         cp_size,
         cp_interleave,
     ) = _get_block_table_args(block_tables, idx_mapping.device)
 
-    _update_eagle_draft_inputs_kernel[(num_reqs,)](
+    if block_tables is not None:
+        slot_mappings = block_tables.slot_mappings
+    else:
+        slot_mappings = torch.zeros(1, dtype=torch.int64, device=idx_mapping.device)
+
+    _update_eagle_decode_inputs_kernel[(num_reqs,)](
         input_buffers.input_ids,
         input_buffers.positions,
         hidden_states,
