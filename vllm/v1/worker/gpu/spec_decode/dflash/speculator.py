@@ -312,6 +312,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             self.parallel_drafting_token_id,
             self.num_query_per_req,
             self.num_speculative_steps,
+            self.max_model_len,
             self.max_num_reqs,
             self.max_num_tokens,
         )
@@ -399,6 +400,7 @@ def _prepare_dflash_inputs_kernel(
     block_size,
     num_query_per_req,
     num_speculative_steps,
+    max_model_len,
     max_num_reqs,
     max_num_tokens,
     PAD_SLOT_ID: tl.constexpr,
@@ -434,6 +436,7 @@ def _prepare_dflash_inputs_kernel(
     # --- Context positions / slots ---
     ctx_pos_idx = ctx_start + tl.where(is_ctx, j, 0)
     ctx_pos = tl.load(target_positions_ptr + ctx_pos_idx, mask=is_ctx, other=0)
+    ctx_pos = tl.minimum(ctx_pos, max_model_len - 1)
     ctx_block_num = ctx_pos // block_size
     ctx_block_num = tl.minimum(ctx_block_num, block_table_stride - 1)
     ctx_block_id = tl.load(
@@ -447,6 +450,7 @@ def _prepare_dflash_inputs_kernel(
 
     # --- Query positions / input_ids / slots ---
     query_pos = last_valid_pos + 1 + query_off
+    query_pos = tl.minimum(query_pos, max_model_len - 1)
     query_idx = query_base + query_off
     is_bonus = is_query & (query_off == 0)
     input_id = tl.where(is_bonus, bonus_token, parallel_drafting_token_id)
@@ -476,7 +480,9 @@ def _prepare_dflash_inputs_kernel(
         # seq_lens is the absolute sequence length the draft attention
         # reads up to (context + query), not just the count of accepted
         # tokens this step.
-        tl.store(out_seq_lens_ptr + req_idx, last_valid_pos + 1 + num_query_per_req)
+        seq_len = last_valid_pos + 1 + num_query_per_req
+        seq_len = tl.minimum(seq_len, max_model_len)
+        tl.store(out_seq_lens_ptr + req_idx, seq_len)
         if req_idx == num_reqs - 1:
             # Pad per-request buffers to max_num_reqs for CUDA graph safety.
             last_query_end = num_reqs * num_query_per_req
@@ -506,6 +512,7 @@ def _prepare_dflash_inputs_kernel(
                 block = i + tl.arange(0, BLOCK_SIZE)
                 mask = block < max_num_tokens
                 tl.store(out_query_slot_mapping_ptr + block, PAD_SLOT_ID, mask=mask)
+                tl.store(out_query_positions_ptr + block, 0, mask=mask)
 
 
 def prepare_dflash_inputs(
@@ -531,6 +538,7 @@ def prepare_dflash_inputs(
     parallel_drafting_token_id: int,
     num_query_per_req: int,
     num_speculative_steps: int,
+    max_model_len: int,
     max_num_reqs: int,
     max_num_tokens: int,
 ) -> None:
@@ -566,6 +574,7 @@ def prepare_dflash_inputs(
         block_size,
         num_query_per_req,
         num_speculative_steps,
+        max_model_len,
         max_num_reqs,
         max_num_tokens,
         PAD_SLOT_ID=PAD_SLOT_ID,
