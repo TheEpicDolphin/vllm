@@ -10,15 +10,14 @@ the same length exist, the GPU kernel picks the right-most (most recent)
 match inside the active context, whereas the CPU implementation returns the
 left-most. The expectations below reflect the GPU behavior.
 
-Also covers the GPU draft-trimming layout helpers in
-``adaptive_verification`` that ngram_gpu shares with DSpark.
+Also covers the per-position acceptance features the speculator publishes for
+adaptive verification, and the verification-layout helper it shares with DSpark.
 """
 
 from __future__ import annotations
 
 from types import SimpleNamespace
 
-import numpy as np
 import pytest
 import torch
 
@@ -28,11 +27,8 @@ from vllm.config import (
     SpeculativeConfig,
     VllmConfig,
 )
-from vllm.v1.worker.gpu.attn_utils import AttentionCGSupportInfo
 from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
-    VariableDraftTrimmer,
     build_verification_layout,
-    maybe_create_draft_trimmer,
 )
 from vllm.v1.worker.gpu.spec_decode.ngram.speculator import NgramGPUSpeculator
 from vllm.v1.worker.gpu.states import RequestState
@@ -158,8 +154,7 @@ def _propose(
         seeds=torch.zeros(B, dtype=torch.int64, device=DEVICE),
         dp_sync=None,
     )
-    num_valid = spec.num_valid_drafts_for_trim[idx_mapping]
-    return drafts.cpu().tolist(), num_valid.cpu().tolist()
+    return drafts.cpu().tolist(), spec.num_valid_drafts[:B].cpu().tolist()
 
 
 # ---------------------------------------------------------------------------
@@ -304,24 +299,23 @@ def test_noncontiguous_idx_mapping():
     assert num_valid == [2, 2]
 
 
-def test_num_valid_written_to_request_slots():
-    """num_valid_drafts_for_trim is req-slot indexed for the draft trimmer."""
+def test_valid_counts_are_batch_indexed():
+    """Counts and features are batch ordered, like draft_token_confidence_probs."""
     spec = _make_speculator(min_n=2, max_n=2, k=2)
     _propose(
         spec,
         [[7, 8, 9, 7, 8], [1, 2, 3, 4, 5]],
         slots=[5, 2],
     )
-    nv = spec.num_valid_drafts_for_trim.cpu()
-    assert nv[5].item() == 2  # match
-    assert nv[2].item() == 0  # no match
+    # Batch row 0 (slot 5) matched; batch row 1 (slot 2) did not.
+    assert spec.num_valid_drafts[:2].cpu().tolist() == [2, 0]
 
 
 def test_dummy_run_does_not_touch_state():
     """Dummy runs must not mutate persistent request or drafter state."""
     spec = _make_speculator(min_n=2, max_n=2, k=2)
     _propose(spec, [[1, 2, 3, 1, 2]], slots=[1])
-    before = spec.num_valid_drafts_for_trim.clone()
+    before = spec.num_valid_drafts.clone()
 
     input_batch = SimpleNamespace(
         num_reqs=1,
@@ -343,7 +337,7 @@ def test_dummy_run_does_not_touch_state():
         dummy_run=True,
     )
     assert drafts.shape == (1, 2)
-    assert torch.equal(spec.num_valid_drafts_for_trim.cpu(), before.cpu())
+    assert torch.equal(spec.num_valid_drafts.cpu(), before.cpu())
 
 
 def test_construction_validates_speculative_config():
@@ -357,7 +351,7 @@ def test_construction_validates_speculative_config():
 
 
 # ---------------------------------------------------------------------------
-# GPU draft trimming (shared verification-layout machinery)
+# Adaptive verification integration
 # ---------------------------------------------------------------------------
 
 
@@ -380,58 +374,82 @@ def test_build_verification_layout_exact_and_gpu_tail():
         assert out_qsl.cpu().tolist()[4:] == [10, 10, 10]
 
 
-def test_variable_draft_trimmer_clamps_to_num_valid():
-    """Scheduled draft slots are clamped per request to the drafter's counts."""
-    max_num_reqs = 8
-    num_valid_drafts = torch.zeros(max_num_reqs, dtype=torch.int32, device=DEVICE)
-    num_valid_drafts[4] = 1  # drafter produced 1 valid draft for slot 4
-    num_valid_drafts[2] = 3  # more than scheduled for slot 2
-    qsl_buf = torch.empty(max_num_reqs + 1, dtype=torch.int32, device=DEVICE)
+def test_confidences_gate_on_adaptive_verification():
+    """The estimator, and so the confidences, exist only when AV is enabled."""
+    off = _make_speculator(min_n=2, max_n=3, k=2)
+    assert off.enable_adaptive_verification is False
+    assert off.acceptance_estimator is None
+    # Without AV nothing consumes confidences, so they stay at their init value.
+    _propose(off, [[1, 2, 3, 1, 2]])
+    assert off.draft_token_confidence_probs.abs().sum().item() == 0.0
 
-    trimmer = VariableDraftTrimmer(
-        num_valid_drafts,
-        qsl_buf,
-        num_bonus_tokens=1,
-        max_num_reqs=max_num_reqs,
-        max_total_logits=1024,
-        device=DEVICE,
-    )
-    # Batch: [slot 4 (2 drafts scheduled), slot 2 (2 drafts), slot 0 (prefill)].
-    idx_mapping = torch.tensor([4, 2, 0], dtype=torch.int64, device=DEVICE)
-    num_draft_tokens_per_req = np.array([2, 2, 0], dtype=np.int32)
-    num_scheduled_tokens = np.array([3, 3, 7], dtype=np.int32)
-
-    cu_num_logits, qsl = trimmer.trim(
-        idx_mapping, num_draft_tokens_per_req, num_scheduled_tokens
-    )
-    # capacities = min(scheduled, num_valid) = [1, 2, 0]
-    assert cu_num_logits.cpu().tolist() == [0, 2, 5, 6]
-    # query lens = non-draft + capacities = [1+1, 1+2, 7+0]
-    assert qsl.cpu().tolist()[:4] == [0, 2, 5, 12]
-    # Padding tail equals the (GPU) batch total.
-    assert qsl.cpu().tolist()[4:] == [12] * (max_num_reqs - 3)
+    cfg = _make_vllm_config(min_n=2, max_n=3, k=2)
+    cfg.speculative_config.enable_adaptive_verification = True
+    on = NgramGPUSpeculator(cfg, DEVICE, _make_request_state(cfg))
+    assert on.acceptance_estimator is not None
 
 
-@pytest.mark.parametrize("batch_sharded_sampling", [False, True])
-def test_draft_trimmer_disabled_with_batch_sharded_sampling(batch_sharded_sampling):
-    """The sharder plans from CPU logits boundaries, so GPU trimming must stay off."""
+def test_filler_slots_predict_near_zero_acceptance():
+    """Unfilled draft slots must score ~0 so adaptive verification trims them.
+
+    Row 0 matches (2 usable drafts), row 1 does not (0 usable). cumprod over the
+    confidences is what AV ranks, so a filler slot has to zero the suffix.
+    """
+    cfg = _make_vllm_config(min_n=2, max_n=2, k=3)
+    cfg.speculative_config.enable_adaptive_verification = True
+    spec = NgramGPUSpeculator(cfg, DEVICE, _make_request_state(cfg))
+
+    _propose(spec, [[1, 2, 1, 2], [4, 5, 6]], last_sampled=[55, 66])
+    conf = spec.draft_token_confidence_probs[:2]
+
+    # Row 0: two real drafts, then filler.
+    assert (conf[0, :2] > 0.05).all()
+    assert conf[0, 2].item() < 1e-6
+    # Row 1: no match at all.
+    assert (conf[1] < 1e-6).all()
+    # Survival is a running product, so it truncates at the first filler slot.
+    assert conf[0].cumprod(dim=0)[2].item() < 1e-6
+
+
+def test_filler_stays_zero_under_a_negative_fitted_slope():
+    """Masking is by count, so the fitted coefficients cannot revive filler.
+
+    The slope has no sign constraint; a negative one would make the old
+    low-feature sentinel look like a near-certain accept.
+    """
+    cfg = _make_vllm_config(min_n=2, max_n=3, k=3)
+    cfg.speculative_config.enable_adaptive_verification = True
+    spec = NgramGPUSpeculator(cfg, DEVICE, _make_request_state(cfg))
+    assert spec.acceptance_estimator is not None
+    spec.acceptance_estimator.slope.fill_(-5.0)
+    spec.acceptance_estimator.intercepts.fill_(5.0)
+
+    # Row matches with 2 usable drafts out of k=3.
+    _propose(spec, [[1, 2, 1, 2]], last_sampled=[55])
+    assert spec.num_valid_drafts[0].item() == 2
+    conf = spec.draft_token_confidence_probs[0]
+    assert (conf[:2] > 0.5).all()  # real drafts score high under this slope
+    assert conf[2].item() == 0.0  # filler stays zero anyway
+
+
+def test_observe_verification_calibrates_the_estimator():
+    """Grading drafts moves the fitted coefficients off their cold start."""
     cfg = _make_vllm_config(min_n=2, max_n=2, k=2)
-    cfg.parallel_config.enable_batch_sharded_sampling = batch_sharded_sampling
-    backend = SimpleNamespace(
-        __name__="FakeBackend",
-        supports_device_cpu_query_lens_mismatch=lambda: True,
-    )
-    trimmer = maybe_create_draft_trimmer(
-        vllm_config=cfg,
-        speculator=SimpleNamespace(
-            num_valid_drafts_for_trim=torch.zeros(8, dtype=torch.int32, device=DEVICE)
-        ),
-        attn_groups=[[SimpleNamespace(backend=backend, layer_names=set())]],
-        attn_cg_support=AttentionCGSupportInfo(),
-        req_states=SimpleNamespace(max_num_reqs=8, vocab_size=32, device=DEVICE),
-        query_start_loc=torch.empty(9, dtype=torch.int32, device=DEVICE),
-        num_bonus_tokens=1,
-    )
-    assert (trimmer is None) == batch_sharded_sampling
-    if trimmer is not None:
-        assert isinstance(trimmer, VariableDraftTrimmer)
+    cfg.speculative_config.enable_adaptive_verification = True
+    spec = NgramGPUSpeculator(cfg, DEVICE, _make_request_state(cfg))
+    estimator = spec.acceptance_estimator
+    assert estimator is not None
+
+    before = estimator.intercepts.clone()
+    idx_mapping = torch.arange(1, dtype=torch.int64, device=DEVICE)
+    for _ in range(estimator.REFIT_INTERVAL):
+        _propose(spec, [[1, 2, 1, 2]])
+        # Both drafts rejected: num_sampled is the bonus token alone.
+        estimator.step(
+            idx_mapping,
+            torch.ones(1, dtype=torch.int32, device=DEVICE),
+            torch.full((1,), 2, dtype=torch.int32, device=DEVICE),
+        )
+    assert estimator._refits == 1
+    # Persistent rejections must push the predicted acceptance down.
+    assert (estimator.intercepts < before).any()

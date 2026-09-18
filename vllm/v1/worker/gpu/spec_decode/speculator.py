@@ -58,16 +58,24 @@ def _target_feeds_hc_residual(vllm_config: VllmConfig) -> bool:
 
 
 class BaseSpeculator(ABC):
-    # Variable-length drafters publish per-request counts of usable drafts
-    # here, [max_num_reqs] int32 indexed by request slot. Leaving it None
-    # means every scheduled draft is verified; setting it opts the drafter
-    # into device-side trimming by the model runner's draft trimmer.
-    num_valid_drafts_for_trim: torch.Tensor | None = None
-
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
         return None
 
     def capture(self) -> None:
+        return None
+
+    def observe_verification(
+        self,
+        idx_mapping: torch.Tensor,
+        num_sampled: torch.Tensor,
+        num_rejected: torch.Tensor,
+    ) -> None:
+        """Fold the target's verdict on the last drafts into the drafter.
+
+        Drafters that calibrate an acceptance estimator override this. Must run
+        before the next `propose`, which overwrites the per-slot features the
+        verdict grades.
+        """
         return None
 
     @abstractmethod

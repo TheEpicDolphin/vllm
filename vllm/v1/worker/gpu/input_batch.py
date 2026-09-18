@@ -461,9 +461,6 @@ def combine_sampled_and_draft_tokens(
     cu_num_logits: torch.Tensor,
     num_logits: int,
     num_new_sampled_tokens: int = 1,  # excl accepted draft tokens, a.k.a bonus tokens
-    # Set when num_logits is only an upper bound (GPU draft trimming), so
-    # unwritten trailing entries hold benign in-bounds indices.
-    zero_init_logits_indices: bool = False,
 ) -> torch.Tensor:
     assert num_new_sampled_tokens in (0, 1), (
         f"num_new_sampled_tokens must be 0 or 1, got {num_new_sampled_tokens}"
@@ -472,8 +469,7 @@ def combine_sampled_and_draft_tokens(
     num_reqs = idx_mapping.shape[0]
     num_speculative_steps = draft_tokens.shape[-1]
 
-    alloc = torch.zeros if zero_init_logits_indices else torch.empty
-    logits_indices = alloc(
+    logits_indices = torch.empty(
         num_logits,
         dtype=torch.int64,
         device=input_ids.device,
@@ -707,21 +703,12 @@ def expand_idx_mapping(
     total_num_logits: int,
     cu_num_logits: torch.Tensor,
     max_expand_len: int,
-    # Set when total_num_logits is only an upper bound (GPU draft trimming),
-    # so unwritten trailing entries hold benign in-bounds values.
-    zero_init: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     num_reqs = idx_mapping.shape[0]
-    if zero_init:
-        expanded_idx_mapping = idx_mapping.new_zeros(total_num_logits)
-        expanded_local_pos = torch.zeros(
-            total_num_logits, dtype=torch.int32, device=idx_mapping.device
-        )
-    else:
-        expanded_idx_mapping = idx_mapping.new_empty(total_num_logits)
-        expanded_local_pos = torch.empty(
-            total_num_logits, dtype=torch.int32, device=idx_mapping.device
-        )
+    expanded_idx_mapping = idx_mapping.new_empty(total_num_logits)
+    expanded_local_pos = torch.empty(
+        total_num_logits, dtype=torch.int32, device=idx_mapping.device
+    )
     _expand_idx_mapping_kernel[(num_reqs,)](
         idx_mapping,
         expanded_idx_mapping,

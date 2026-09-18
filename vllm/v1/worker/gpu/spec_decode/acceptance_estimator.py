@@ -310,6 +310,66 @@ def _predict_kernel(
     tl.store(conf_ptr + batch_idx * conf_stride + step, prob)
 
 
+@triton.jit
+def _predict_from_features_kernel(
+    features_ptr,
+    features_stride,
+    pred_ptr,
+    pred_stride,
+    conf_ptr,
+    conf_stride,
+    raw_features_ptr,
+    raw_features_stride,
+    valid_counts_ptr,
+    slope_ptr,
+    intercepts_ptr,
+    idx_mapping_ptr,
+    idx_mapping_stride,
+    num_reqs,
+    NUM_SPECULATIVE_STEPS: tl.constexpr,
+    MAX_LOG_ODDS: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    batch_idx = tl.program_id(0).to(tl.int64)
+    if batch_idx >= num_reqs:
+        return
+
+    req_state_idx = tl.load(idx_mapping_ptr + batch_idx * idx_mapping_stride).to(
+        tl.int64
+    )
+    if req_state_idx < 0:
+        # Cudagraph-padded requests carry -1. Skip them so that they don't
+        # scatter garbage over a live request's features.
+        return
+
+    steps = tl.arange(0, BLOCK_K)
+    mask = steps < NUM_SPECULATIVE_STEPS
+
+    # The drafter scored every position in one pass, so its features are batch
+    # ordered; the estimator keeps them in persistent request slots.
+    feature = tl.load(
+        raw_features_ptr + batch_idx * raw_features_stride + steps,
+        mask=mask,
+        other=0.0,
+    )
+    feature = tl.minimum(tl.maximum(feature, -MAX_LOG_ODDS), MAX_LOG_ODDS)
+    tl.store(features_ptr + req_state_idx * features_stride + steps, feature, mask=mask)
+
+    weight = tl.load(slope_ptr)
+    bias = tl.load(intercepts_ptr + steps, mask=mask, other=0.0)
+    prob = tl.sigmoid(weight * feature + bias)
+
+    # Slots the drafter could not fill accept with probability 0. Force that
+    # here rather than encoding it as an extreme feature: the fitted slope has
+    # no sign constraint, so a negative one would turn a low-feature sentinel
+    # into a near-certain accept and hand those slots a draft budget.
+    num_valid = tl.load(valid_counts_ptr + batch_idx).to(tl.int64)
+    prob = tl.where(steps < num_valid, prob, 0.0)
+
+    tl.store(pred_ptr + req_state_idx * pred_stride + steps, prob, mask=mask)
+    tl.store(conf_ptr + batch_idx * conf_stride + steps, prob, mask=mask)
+
+
 class OnlineAcceptanceEstimator:
     """Predicts per-position acceptance, and calibrates itself while serving.
 
@@ -498,4 +558,47 @@ class OnlineAcceptanceEstimator:
             NUM_SPECULATIVE_STEPS=self.num_speculative_steps,
             MAX_LOG_ODDS=_MAX_LOG_ODDS,
             PADDED_VOCAB_NUM_BLOCKS=triton.next_power_of_2(num_blocks),
+        )
+
+    def predict_from_features(
+        self,
+        raw_features: torch.Tensor,
+        valid_counts: torch.Tensor,
+        idx_mapping: torch.Tensor,
+        confidence_probs: torch.Tensor,
+    ) -> None:
+        """Score features a drafter computed itself, instead of draft logits.
+
+        Drafters without a draft distribution (e.g. n-gram) supply one scalar
+        per (batch row, draft position) in ``raw_features``. Everything else —
+        the logistic, the grading in ``step`` and the refit — is shared with the
+        draft-logit path.
+
+        ``valid_counts`` is the per-row number of leading slots the drafter
+        actually filled; the rest predict 0 regardless of the fitted
+        coefficients.
+
+        Like ``logit(max q)``, a feature must be a function of the prefix alone
+        and never of the token drafted from it, or trimming would condition on
+        the token being trimmed and bias the emitted distribution.
+        """
+        num_reqs = idx_mapping.shape[0]
+        _predict_from_features_kernel[(num_reqs,)](
+            self.features,
+            self.features.stride(0),
+            self.predictions,
+            self.predictions.stride(0),
+            confidence_probs,
+            confidence_probs.stride(0),
+            raw_features,
+            raw_features.stride(0),
+            valid_counts,
+            self.slope,
+            self.intercepts,
+            idx_mapping,
+            idx_mapping.stride(0),
+            num_reqs,
+            NUM_SPECULATIVE_STEPS=self.num_speculative_steps,
+            MAX_LOG_ODDS=_MAX_LOG_ODDS,
+            BLOCK_K=triton.next_power_of_2(self.num_speculative_steps),
         )
