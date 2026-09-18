@@ -9,6 +9,9 @@ import torch
 from vllm.config import VllmConfig
 from vllm.triton_utils import HAS_TRITON, tl, triton
 from vllm.v1.worker.gpu.input_batch import InputBatch
+from vllm.v1.worker.gpu.spec_decode.acceptance_estimator import (
+    OnlineAcceptanceEstimator,
+)
 from vllm.v1.worker.gpu.spec_decode.speculator import BaseSpeculator
 
 if TYPE_CHECKING:
@@ -96,10 +99,13 @@ def _ngram_finalize_kernel(
     last_sampled_ptr,  # *int64  [max_num_reqs]
     scratch_ptr,  # *int64  [B, scratch_stride]
     scratch_stride,
-    drafts_ptr,  # *int64  [B, K]           (output, batch indexed)
-    num_valid_ptr,  # *int32  [max_num_reqs]   (output, req-slot indexed)
+    drafts_ptr,  # *int64  [B, K]   (output, batch indexed)
+    features_ptr,  # *fp32   [B, K]   (output, batch indexed)
+    features_stride,
+    num_valid_ptr,  # *int32  [B]      (output, batch indexed)
     L,
     N_BLOCKS,
+    MIN_N: tl.constexpr,
     K: tl.constexpr,
     K_PO2: tl.constexpr,
     N_BLOCKS_PO2: tl.constexpr,
@@ -132,11 +138,21 @@ def _ngram_finalize_kernel(
     tokens_avail = tl.maximum(seq_len - draft_start, 0)
     write_ok = (num_sampled > 0) & has_match
     nv = tl.where(write_ok, tl.minimum(tl.cast(K, tl.int64), tokens_avail), 0)
-    tl.store(num_valid_ptr + req_state_idx, nv.to(tl.int32))
+    tl.store(num_valid_ptr + b, nv.to(tl.int32))
 
     row_off = req_state_idx * token_ids_stride
     k_iota = tl.arange(0, K_PO2).to(tl.int64)
     k_in_range = k_iota < K
+
+    # Feature for the acceptance estimator: how long a suffix matched, centred
+    # on MIN_N so the per-position intercepts carry the base rate. A longer
+    # matched context is stronger evidence that the continuation repeats. It is
+    # a function of the prefix alone and never of the token drafted from it,
+    # which is what keeps trimming lossless. Slots the drafter could not fill
+    # score a neutral 0 and are zeroed by count downstream.
+    matched_n = (best_n - MIN_N).to(tl.float32)
+    feature = tl.where(k_iota < nv, matched_n, 0.0)
+    tl.store(features_ptr + b * features_stride + k_iota, feature, mask=k_in_range)
     gather_idx = tl.minimum(draft_start + k_iota, tl.cast(L, tl.int64) - 1)
     slot_valid = (k_iota < tokens_avail) & write_ok & k_in_range
     gathered = tl.load(
@@ -144,9 +160,12 @@ def _ngram_finalize_kernel(
         mask=slot_valid,
         other=0,
     ).to(tl.int64)
-    # Invalid slots fall back to the last sampled token; they are either
-    # trimmed from the verification batch on GPU or verified as ordinary
-    # (rejectable) drafts, so the fill value only affects efficiency.
+    # Unfilled slots fall back to the last sampled token. Adaptive
+    # verification scores them 0 and trims them; without it they are verified
+    # as ordinary (rejectable) drafts. Either way the fill value only affects
+    # efficiency, never correctness -- though a value the target is unlikely to
+    # sample keeps the acceptance metrics honest, and the last sampled token is
+    # not that in repetitive text.
     out = tl.where(slot_valid, gathered, last_tok)
     tl.store(drafts_ptr + b * K + k_iota, out, mask=k_in_range)
 
@@ -201,11 +220,6 @@ class NgramGPUSpeculator(BaseSpeculator):
         self.scratch = torch.zeros(
             (self.max_num_reqs, self.n_blocks), dtype=torch.int64, device=device
         )
-        # Per request-slot count of usable drafts from the latest proposal,
-        # consumed by the model runner's GPU draft trimmer.
-        self.num_valid_drafts_for_trim = torch.zeros(
-            self.max_num_reqs, dtype=torch.int32, device=device
-        )
         # Batch-ordered draft output, scattered into RequestState.draft_tokens
         # by the model runner (same contract as the model-based speculators).
         self.drafts = torch.zeros(
@@ -213,6 +227,44 @@ class NgramGPUSpeculator(BaseSpeculator):
             dtype=torch.int64,
             device=device,
         )
+
+        # Adaptive verification reads per-position acceptance probabilities to
+        # pick a draft budget and to lay out the verification batch. Without it
+        # every scheduled draft slot is verified, filler included.
+        self.enable_adaptive_verification = spec.enable_adaptive_verification
+        self.acceptance_estimator: OnlineAcceptanceEstimator | None = None
+        self.draft_token_confidence_probs = torch.zeros(
+            (self.max_num_reqs, self.num_speculative_steps),
+            dtype=torch.float32,
+            device=device,
+        )
+        # Batch-ordered per-position features the estimator turns into the
+        # probabilities above. n-gram has no draft distribution to score, so
+        # the proposal kernel emits these directly.
+        self.draft_features = torch.zeros(
+            (self.max_num_reqs, self.num_speculative_steps),
+            dtype=torch.float32,
+            device=device,
+        )
+        # Batch-ordered count of leading draft slots the kernel actually filled.
+        self.num_valid_drafts = torch.zeros(
+            self.max_num_reqs, dtype=torch.int32, device=device
+        )
+        if self.enable_adaptive_verification:
+            self.acceptance_estimator = OnlineAcceptanceEstimator(
+                self.max_num_reqs,
+                self.num_speculative_steps,
+                device,
+            )
+
+    def observe_verification(
+        self,
+        idx_mapping: torch.Tensor,
+        num_sampled: torch.Tensor,
+        num_rejected: torch.Tensor,
+    ) -> None:
+        if self.acceptance_estimator is not None:
+            self.acceptance_estimator.step(idx_mapping, num_sampled, num_rejected)
 
     @torch.inference_mode()
     def propose(
@@ -270,13 +322,24 @@ class NgramGPUSpeculator(BaseSpeculator):
             self.scratch,
             self.scratch.stride(0),
             self.drafts,
-            self.num_valid_drafts_for_trim,
+            self.draft_features,
+            self.draft_features.stride(0),
+            self.num_valid_drafts,
             self.max_model_len,
             self.n_blocks,
+            self.min_n,
             self.num_speculative_steps,
             max(1, triton.next_power_of_2(self.num_speculative_steps)),
             max(1, triton.next_power_of_2(self.n_blocks)),
             num_warps=2,
             num_stages=1,
         )
+
+        if self.acceptance_estimator is not None:
+            self.acceptance_estimator.predict_from_features(
+                self.draft_features,
+                self.num_valid_drafts,
+                idx_mapping,
+                self.draft_token_confidence_probs,
+            )
         return self.drafts[:num_reqs]

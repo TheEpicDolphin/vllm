@@ -155,9 +155,7 @@ from vllm.v1.worker.gpu.shutdown import free_before_shutdown
 from vllm.v1.worker.gpu.spec_decode import init_speculator
 from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
     AdaptiveVerificationManager,
-    VariableDraftTrimmer,
     maybe_create_adaptive_verification_manager,
-    maybe_create_draft_trimmer,
     resolve_adaptive_cudagraph_mode,
 )
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
@@ -331,7 +329,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         self.step_timing = StepTimingCollector()
         self.adaptive_verification: AdaptiveVerificationManager | None = None
-        self.draft_trimmer: VariableDraftTrimmer | None = None
         self.input_buffers = InputBuffers(
             max_num_reqs=self.max_num_reqs,
             max_num_tokens=self.max_num_tokens,
@@ -672,19 +669,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             target_layer_names=target_attn_layer_names,
             additional_attn_cg_support=additional_attn_cg_support,
         )
-        # Variable-length drafters (ngram_gpu) trim scheduled draft slots to
-        # the drafter's valid counts on GPU, when supported.
-        self.draft_trimmer = None
-        if self.adaptive_verification is None:
-            self.draft_trimmer = maybe_create_draft_trimmer(
-                vllm_config=self.vllm_config,
-                speculator=self.speculator,
-                attn_groups=self.attn_groups,
-                attn_cg_support=attn_cg_support,
-                req_states=self.req_states,
-                query_start_loc=self.input_buffers.query_start_loc,
-                num_bonus_tokens=self.model_state.num_new_sampled_tokens_per_step,
-            )
 
         self.block_tables = BlockTables(
             block_sizes=block_sizes,
@@ -723,9 +707,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         piecewise_capture_available = bool(
             envs.VLLM_USE_BREAKABLE_CUDAGRAPH or has_compiled_submodule(self.model)
         )
-        varlen_decode = (
-            self.adaptive_verification is not None or self.draft_trimmer is not None
-        )
         if self.adaptive_verification is not None:
             self.compilation_config.cudagraph_mode = resolve_adaptive_cudagraph_mode(
                 self.compilation_config.cudagraph_mode,
@@ -741,7 +722,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             max_num_reqs=self.max_num_reqs,
             is_profiling=is_profiling,
             piecewise_capture_available=piecewise_capture_available,
-            varlen_decode=varlen_decode,
         )
         self.cudagraph_manager = ModelCudaGraphManager(
             self.vllm_config,
@@ -749,7 +729,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             cudagraph_mode,
             decode_query_len=self.decode_query_len,
             lora_capture_cases=self.lora_capture_cases,
-            varlen_decode=varlen_decode,
+            varlen_decode=self.adaptive_verification is not None,
             ubatch_runner=self.ubatch_runner,
         )
         if self.cache_config.kv_sharing_fast_prefill and self.pcp_manager is None:
@@ -1349,16 +1329,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         adaptive_verification = (
             self.adaptive_verification if num_draft_tokens_per_req is not None else None
         )
-        draft_trimmer = None
-        if (
-            adaptive_verification is None
-            and num_draft_tokens_per_req is not None
-            and self.draft_trimmer is not None
-            # The chunked logits path indexes by the CPU (untrimmed) offsets,
-            # which cannot address the trimmed layout.
-            and total_num_logits <= self.draft_trimmer.max_total_logits
-        ):
-            draft_trimmer = self.draft_trimmer
         num_scheduled_tokens_upper_bound = num_scheduled_tokens_np
         if adaptive_verification is not None:
             # num_scheduled_tokens represents the draft budget evenly distributed across
@@ -1388,21 +1358,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 adaptive_verification.reallocate_drafts(req_ids, idx_mapping)
             )
             total_num_logits = num_reqs * num_bonus_tokens + total_num_draft_tokens
-        elif draft_trimmer is not None:
-            # Clamp scheduled draft slots to the drafter's valid counts on GPU.
-            # CPU-side totals remain upper bounds; trimmed gap treated as padding.
-            cu_num_logits, query_start_loc = draft_trimmer.trim(
-                idx_mapping, num_draft_tokens_per_req, num_scheduled_tokens_np
-            )
         if draft_tokens:
             expanded_idx_mapping, expanded_local_pos = expand_idx_mapping(
-                idx_mapping,
-                total_num_logits,
-                cu_num_logits,
-                self.decode_query_len,
-                # With GPU trimming, total_num_logits is an upper bound; the
-                # gap must hold benign (in-bounds) values.
-                zero_init=draft_trimmer is not None,
+                idx_mapping, total_num_logits, cu_num_logits, self.decode_query_len
             )
         query_start_loc_np = query_start_loc_np[: num_reqs_padded + 1]
         query_start_loc = query_start_loc[: num_reqs_padded + 1]
@@ -1442,7 +1400,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             cu_num_logits,
             total_num_logits,
             self.model_state.num_new_sampled_tokens_per_step,
-            zero_init_logits_indices=draft_trimmer is not None,
         )
 
         fast_prefill = None
@@ -1504,7 +1461,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             fast_prefill=fast_prefill,
             max_query_len=(
                 int(num_scheduled_tokens_upper_bound.max())
-                if adaptive_verification is not None or draft_trimmer is not None
+                if adaptive_verification is not None
                 else None
             ),
         )
@@ -2181,10 +2138,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         if self.speculator is not None:
             assert self.sampler is not None
-            if isinstance(self.speculator, DraftModelSpeculator):
-                self.speculator.observe_verification(
-                    input_batch.idx_mapping, num_sampled, num_rejected
-                )
+            self.speculator.observe_verification(
+                input_batch.idx_mapping, num_sampled, num_rejected
+            )
             spec_hidden_states = self._get_drafter_hidden_states(draft_hidden_states)
             if isinstance(self.sampler, GPUWatermarkSampler):
                 self.speculator.prepare_watermarking(
