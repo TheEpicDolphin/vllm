@@ -295,6 +295,7 @@ if TYPE_CHECKING:
     VLLM_DEBUG_WORKSPACE: bool = False
     VLLM_DISABLE_SHARED_EXPERTS_STREAM: bool = False
     VLLM_DISABLE_DSV4_MEGAMOE_SHARED_EXPERT_FUSION: bool = False
+    VLLM_DFLASH_DISABLE_CONTEXT_TRIM: bool = False
     VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD: int = 256
     VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: int = 1024
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
@@ -2027,6 +2028,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # SM100 kernel as the routed FP4 experts.
     "VLLM_DISABLE_DSV4_MEGAMOE_SHARED_EXPERT_FUSION": lambda: bool(
         int(os.getenv("VLLM_DISABLE_DSV4_MEGAMOE_SHARED_EXPERT_FUSION", "0"))
+    ),
+    # Stage the full context for the DFlash K/V precompute instead of trimming
+    # it to the drafter's sliding window (A/B and debugging aid).
+    "VLLM_DFLASH_DISABLE_CONTEXT_TRIM": lambda: bool(
+        int(os.getenv("VLLM_DFLASH_DISABLE_CONTEXT_TRIM", "0"))
     ),
     # Limits when we run shared_experts in a separate stream.
     # We found out that for large batch sizes, the separate stream

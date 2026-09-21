@@ -3,9 +3,11 @@
 import copy
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn as nn
 
+import vllm.envs as envs
 from vllm.config import VllmConfig, replace
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, set_forward_context
@@ -25,8 +27,12 @@ from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.spec_decode.dflash.cudagraph import DFlashCudaGraphManager
 from vllm.v1.worker.gpu.spec_decode.dflash.utils import load_dflash_model
+from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
+    get_eagle3_aux_layers_from_config,
+)
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 from vllm.v1.worker.gpu.spec_decode.utils import get_parallel_drafting_token_id
+from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.utils import AttentionGroup
 
 logger = init_logger(__name__)
@@ -35,7 +41,10 @@ logger = init_logger(__name__)
 class DFlashSpeculator(DraftModelSpeculator):
     _speculator_name = "DFlash"  # For logging, so we can share methods with subclasses
 
-    def __init__(self, vllm_config: VllmConfig, device: torch.device):
+    def __init__(
+        self, vllm_config: VllmConfig, device: torch.device, req_states: RequestState
+    ):
+        self.req_states = req_states
         parallel_config = vllm_config.parallel_config
         if parallel_config.prefill_context_parallel_size > 1:
             vllm_config = copy.copy(vllm_config)
@@ -48,6 +57,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         self.hidden_states = torch.zeros(
             self.max_num_tokens, self.hidden_size, dtype=self.dtype, device=device
         )
+        self.aux_hidden_states: torch.Tensor | None = None
 
         # Multimodal inputs not currently supported.
         self.supports_mm_inputs = False
@@ -108,6 +118,9 @@ class DFlashSpeculator(DraftModelSpeculator):
 
         self.query_cudagraph_manager: DFlashCudaGraphManager | None = None
         self.draft_kv_cache_group_id: int = -1
+        # Upper bound on the trailing context rows staged per request for the
+        # K/V precompute, or None to stage the full context. Resolved in set_attn.
+        self.max_sliding_window: int | None = None
 
     @property
     def attn_vllm_config(self) -> VllmConfig:
@@ -170,6 +183,22 @@ class DFlashSpeculator(DraftModelSpeculator):
     ) -> nn.Module:
         return load_dflash_model(target_model, self.vllm_config)
 
+    def load_model(self, target_model: nn.Module) -> None:
+        super().load_model(target_model)
+        # The target emits one [num_tokens, hidden] aux tensor per layer that
+        # set_eagle3_aux_hidden_state_layers resolves, via the same lookup.
+        aux_layers = get_eagle3_aux_layers_from_config(self.speculative_config)
+        if not aux_layers:
+            aux_layers = target_model.get_eagle3_default_aux_hidden_state_layers()
+        # Concatenated aux hidden states of the trimmed context, feeding
+        # combine_hidden_states.
+        self.aux_hidden_states = torch.empty(
+            self.max_num_tokens,
+            len(aux_layers) * self.vllm_config.model_config.get_hidden_size(),
+            dtype=self.dtype,
+            device=self.device,
+        )
+
     def set_attn(
         self,
         model_state: ModelState,
@@ -189,15 +218,32 @@ class DFlashSpeculator(DraftModelSpeculator):
         # FlashAttention's AOT split schedule is wrong for a windowed drafter,
         # and `_get_sliding_window_configs` leaves it on or off depending on
         # whether the target also runs FlashAttention. Decide it here instead.
+        windows: list[int] = []
+        has_full_attention = False
         for groups in self.attn_groups:
             for group in groups:
                 builder = group.get_metadata_builder()
-                if getattr(
-                    builder, "aot_schedule", False
-                ) and get_kv_cache_spec_sliding_window(builder.kv_cache_spec):
+                window = get_kv_cache_spec_sliding_window(builder.kv_cache_spec)
+                if window is None:
+                    has_full_attention = True
+                    continue
+                windows.append(window)
+                if getattr(builder, "aot_schedule", False):
                     # `aot_schedule` belongs to FlashAttention's builder, not
                     # to the base class this loop is typed against.
                     builder.aot_schedule = False  # type: ignore[attr-defined]
+        self.max_sliding_window = (
+            max(windows) + self.num_query_per_req
+            if windows and not has_full_attention
+            else None
+        )
+        if envs.VLLM_DFLASH_DISABLE_CONTEXT_TRIM:
+            self.max_sliding_window = None
+        logger.info_once(
+            "%s context K/V precompute trimmed to %s trailing rows per request.",
+            self._speculator_name,
+            self.max_sliding_window,
+        )
 
         self.draft_kv_cache_group_ids = [
             gid for gid, g in enumerate(self.attn_groups) if g
@@ -237,6 +283,125 @@ class DFlashSpeculator(DraftModelSpeculator):
                         layer_names, self.model.get_draft_attn_causal()
                     )
                 }
+
+    def _copy_context_full(
+        self,
+        num_target_tokens: int,
+        last_hidden_states: torch.Tensor,
+        aux_hidden_states: list[torch.Tensor] | None,
+    ) -> None:
+        # NOTE: To avoid CPU-GPU synchronization without CPU knowing the
+        # number of rejected tokens, we maintain the size of input_ids and
+        # hidden_states the same as the target model's. This means, we pad each
+        # request's query length to include any rejected positions.
+        if aux_hidden_states:
+            assert self.aux_hidden_states is not None
+            torch.cat(
+                [states[:num_target_tokens] for states in aux_hidden_states],
+                dim=-1,
+                out=self.aux_hidden_states[:num_target_tokens],
+            )
+            hidden_states = self.model.combine_hidden_states(
+                self.aux_hidden_states[:num_target_tokens]
+            )
+        else:
+            hidden_states = last_hidden_states[:num_target_tokens]
+        self.hidden_states[:num_target_tokens].copy_(hidden_states)
+
+    def _copy_context_window(
+        self,
+        input_batch: InputBatch,
+        prefill_lens: torch.Tensor,
+        num_target_tokens: int,
+        last_hidden_states: torch.Tensor,
+        aux_hidden_states: list[torch.Tensor] | None,
+    ) -> None:
+        assert self.max_sliding_window is not None
+        if aux_hidden_states:
+            assert self.aux_hidden_states is not None
+            for i, layer_hidden_states in enumerate(aux_hidden_states):
+                hidden_size = layer_hidden_states.shape[-1]
+                _gather_context_tail(
+                    self.aux_hidden_states[:, hidden_size * i : hidden_size * (i + 1)],
+                    layer_hidden_states,
+                    input_batch,
+                    prefill_lens,
+                    self.max_sliding_window,
+                )
+            hidden_states = self.model.combine_hidden_states(
+                self.aux_hidden_states[:num_target_tokens]
+            )
+            self.hidden_states[:num_target_tokens].copy_(hidden_states)
+        else:
+            _gather_context_tail(
+                self.hidden_states,
+                last_hidden_states,
+                input_batch,
+                prefill_lens,
+                self.max_sliding_window,
+            )
+
+    def _copy_context(
+        self,
+        input_batch: InputBatch,
+        prefill_lens: torch.Tensor | None,
+        num_target_tokens: int,
+        last_hidden_states: torch.Tensor,
+        aux_hidden_states: list[torch.Tensor] | None,
+    ) -> int:
+        """Stage the target hidden states the context K/V precompute reads and
+        return the number of context rows.
+
+        A windowed drafter only reads context within context_tail_len of the
+        prompt end: drafts proposed mid-prompt are discarded by the scheduler,
+        so a prefill chunk contributes only its rows inside that final window,
+        and a chunk ending before it contributes none. prepare_dflash_inputs
+        lays out positions and slots by the same rule (_get_context_tail_length),
+        computed from device-side inputs; the host mirror below only decides
+        whether anything is trimmed and bounds the compact row count. The
+        layout is the identity when no span exceeds its tail.
+        """
+        if self.max_sliding_window is None:
+            self._copy_context_full(
+                num_target_tokens, last_hidden_states, aux_hidden_states
+            )
+            return num_target_tokens
+        assert prefill_lens is not None
+
+        num_reqs = input_batch.num_reqs
+        query_lens = input_batch.num_scheduled_tokens[:num_reqs]
+        num_computed_prefill = (
+            input_batch.num_computed_prefill_tokens_np[:num_reqs] + query_lens
+        )
+        window_start = input_batch.prefill_len_np[:num_reqs] - self.max_sliding_window
+        context_lens = np.minimum(
+            query_lens,
+            np.where(
+                input_batch.is_prefilling_np[:num_reqs],
+                np.clip(num_computed_prefill - window_start, 0, None),
+                self.max_sliding_window,
+            ),
+        )
+        if (context_lens == query_lens).all():
+            self._copy_context_full(
+                num_target_tokens, last_hidden_states, aux_hidden_states
+            )
+            return num_target_tokens
+
+        # Host upper bound on the compact row count. Adaptive verification
+        # reassigns spans on the GPU, so rows past the true total must be
+        # inert: PAD slots write no KV and position 0 keeps RoPE in range.
+        # prepare_dflash_inputs writes the real rows on top of this fill.
+        num_target_tokens = int(context_lens.sum())
+        if num_target_tokens > 0:
+            self._copy_context_window(
+                input_batch,
+                prefill_lens,
+                num_target_tokens,
+                last_hidden_states,
+                aux_hidden_states,
+            )
+        return num_target_tokens
 
     @torch.inference_mode()
     def _run_model(
@@ -333,22 +498,13 @@ class DFlashSpeculator(DraftModelSpeculator):
             max_seq_len + self.num_query_per_req, self.max_model_len
         )
 
-        # NOTE: To avoid CPU-GPU synchronization without CPU knowing the
-        # number of rejected tokens, we maintain the size of input_ids and
-        # hidden_states the same as the target model's. This means, we pad each
-        # request's query length to include any rejected positions.
-        if aux_hidden_states:
-            hidden_states = self.model.combine_hidden_states(
-                torch.cat(aux_hidden_states, dim=-1)
-            )
-        else:
-            hidden_states = last_hidden_states
-        self.hidden_states[:num_target_tokens].copy_(hidden_states[:num_target_tokens])
-
         if dummy_run and skip_attn_for_dummy_run:
             # Memory profiling path: block_tables / kv_cache_config are not initialized.
             # Since DFlash needs to build its own attention metadata, we must skip the
             # preparation in this path and run a minimal forward pass.
+            self._copy_context_full(
+                num_target_tokens, last_hidden_states, aux_hidden_states
+            )
             self.model.precompute_and_store_context_kv(
                 self.hidden_states[:num_target_tokens],
                 self.context_positions[:num_target_tokens],
@@ -370,6 +526,17 @@ class DFlashSpeculator(DraftModelSpeculator):
             self.block_tables.gather_block_tables(
                 input_batch.idx_mapping, num_reqs_padded=num_reqs
             )
+
+        prefill_len = self.req_states.prefill_len.gpu
+        num_target_tokens = self._copy_context(
+            input_batch,
+            prefill_len,
+            num_target_tokens,
+            last_hidden_states,
+            aux_hidden_states,
+        )
+        self.context_positions[:num_target_tokens].zero_()
+        self._context_slot_mappings[:, :num_target_tokens].fill_(PAD_SLOT_ID)
 
         # The query slot mapping is written into the shared BlockTables slot_mappings.
         # That buffer's address is what the captured CUDA graph reads from at replay.
@@ -405,6 +572,8 @@ class DFlashSpeculator(DraftModelSpeculator):
                 self.max_num_tokens,
                 self.max_model_len,
                 self.sample_from_anchor,
+                prefill_len=prefill_len,
+                context_tail_len=self.max_sliding_window,
             )
 
         # Pre-insert context K/V into the cache. Runs eagerly outside the captured graph
@@ -420,11 +589,12 @@ class DFlashSpeculator(DraftModelSpeculator):
             ]
         else:
             context_slots = self._context_slot_mappings[0][:num_target_tokens]
-        self.model.precompute_and_store_context_kv(
-            self.hidden_states[:num_target_tokens],
-            self.context_positions[:num_target_tokens],
-            context_slots,
-        )
+        if num_target_tokens > 0:
+            self.model.precompute_and_store_context_kv(
+                self.hidden_states[:num_target_tokens],
+                self.context_positions[:num_target_tokens],
+                context_slots,
+            )
 
         batch_sync, num_batch_tokens = (
             self._build_uniform_batch_dp_sync(dp_sync, num_reqs, self.num_query_per_req)
@@ -482,6 +652,149 @@ class DFlashSpeculator(DraftModelSpeculator):
         return self.draft_tokens[:num_reqs]
 
 
+# Requests summed per iteration when deriving a request's compact row offset.
+_COMPACT_BLOCK_R = 256
+
+
+@triton.jit
+def _context_tail_length(
+    query_start_loc_ptr,
+    positions_ptr,
+    idx_mapping_ptr,
+    prefill_lens_ptr,
+    req_idx,
+    req_mask,
+    max_context_tail_len,
+):
+    query_start = tl.load(query_start_loc_ptr + req_idx, mask=req_mask, other=0)
+    query_end = tl.load(query_start_loc_ptr + req_idx + 1, mask=req_mask, other=0)
+    query_len = query_end - query_start
+    first_pos = tl.load(positions_ptr + query_start, mask=req_mask, other=0).to(
+        tl.int32
+    )
+    req_state = tl.load(idx_mapping_ptr + req_idx, mask=req_mask, other=0)
+    prefill_len = tl.load(prefill_lens_ptr + req_state, mask=req_mask, other=0)
+    window_rows = first_pos + query_len - (prefill_len - max_context_tail_len)
+    tail_cap = tl.where(
+        first_pos < prefill_len, tl.maximum(window_rows, 0), max_context_tail_len
+    )
+    return tl.minimum(query_len, tail_cap)
+
+
+@triton.jit
+def _cumulative_context_tail_length(
+    query_start_loc_ptr,
+    positions_ptr,
+    idx_mapping_ptr,
+    prefill_len_ptr,
+    req_idx,
+    max_context_tail_len,
+    BLOCK_R: tl.constexpr,
+):
+    acc = tl.zeros((BLOCK_R,), dtype=tl.int32)
+    for start in range(0, req_idx, BLOCK_R):
+        req_block = start + tl.arange(0, BLOCK_R)
+        req_mask = req_block < req_idx
+        acc += _context_tail_length(
+            query_start_loc_ptr,
+            positions_ptr,
+            idx_mapping_ptr,
+            prefill_len_ptr,
+            req_block,
+            req_mask,
+            max_context_tail_len,
+        )
+    return tl.sum(acc)
+
+
+@triton.jit
+def _gather_context_tail_kernel(
+    out_hidden_states_ptr,
+    out_hidden_states_stride,
+    hidden_states_ptr,
+    hidden_states_stride,
+    query_start_loc_ptr,
+    positions_ptr,
+    idx_mapping_ptr,
+    prefill_lens_ptr,
+    max_context_tail_len,
+    hidden_size,
+    BLOCK_Q: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+):
+    req_idx = tl.program_id(0)
+    query_block_idx = tl.program_id(1)
+    dim_block_idx = tl.program_id(2)
+    ctx_tail_len = _context_tail_length(
+        query_start_loc_ptr,
+        positions_ptr,
+        idx_mapping_ptr,
+        prefill_lens_ptr,
+        req_idx,
+        req_idx >= 0,
+        max_context_tail_len,
+    )
+    ctx_src_start = tl.load(query_start_loc_ptr + req_idx + 1) - ctx_tail_len
+    ctx_dst_start = _cumulative_context_tail_length(
+        query_start_loc_ptr,
+        positions_ptr,
+        idx_mapping_ptr,
+        prefill_lens_ptr,
+        req_idx,
+        max_context_tail_len,
+        BLOCK_R,
+    )
+    query_block = query_block_idx * BLOCK_Q + tl.arange(0, BLOCK_Q)
+    dim_block = dim_block_idx * BLOCK_H + tl.arange(0, BLOCK_H)
+    mask = (query_block < ctx_tail_len)[:, None] & (dim_block < hidden_size)[None, :]
+    hidden_states = tl.load(
+        hidden_states_ptr
+        + (ctx_src_start + query_block).to(tl.int64)[:, None] * hidden_states_stride
+        + dim_block[None, :],
+        mask=mask,
+    )
+    tl.store(
+        out_hidden_states_ptr
+        + (ctx_dst_start + query_block).to(tl.int64)[:, None] * out_hidden_states_stride
+        + dim_block[None, :],
+        hidden_states,
+        mask=mask,
+    )
+
+
+def _gather_context_tail(
+    out_hidden_states: torch.Tensor,
+    hidden_states: torch.Tensor,
+    input_batch: InputBatch,
+    prefill_len: torch.Tensor,
+    max_context_tail_len: int,
+) -> None:
+    hidden_size = hidden_states.shape[1]
+    query_block_size = 16
+    hidden_block_size = 256
+    grid = (
+        input_batch.num_reqs,
+        triton.cdiv(max_context_tail_len, query_block_size),
+        triton.cdiv(hidden_size, hidden_block_size),
+    )
+    _gather_context_tail_kernel[grid](
+        out_hidden_states,
+        out_hidden_states.stride(0),
+        hidden_states,
+        hidden_states.stride(0),
+        input_batch.query_start_loc,
+        input_batch.positions,
+        input_batch.idx_mapping,
+        prefill_len,
+        max_context_tail_len,
+        hidden_size,
+        BLOCK_Q=query_block_size,
+        BLOCK_H=hidden_block_size,
+        BLOCK_R=_COMPACT_BLOCK_R,
+    )
+
+
 @triton.jit
 def _prepare_dflash_inputs_kernel(
     # Outputs
@@ -520,11 +833,15 @@ def _prepare_dflash_inputs_kernel(
     max_num_tokens,
     max_model_len,
     cp_rank,
+    prefill_lens_ptr,
+    max_context_tail_len,
     SAMPLE_FROM_ANCHOR: tl.constexpr,
     PAD_SLOT_ID: tl.constexpr,
     CP_SIZE: tl.constexpr,
     CP_INTERLEAVE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    TRIM_CONTEXT: tl.constexpr,
+    BLOCK_R: tl.constexpr,
 ):
     req_idx = tl.program_id(0)
     block_idx = tl.program_id(1)
@@ -534,6 +851,33 @@ def _prepare_dflash_inputs_kernel(
     ctx_start = tl.load(target_query_start_loc_ptr + req_idx)
     ctx_end = tl.load(target_query_start_loc_ptr + req_idx + 1)
     num_ctx = ctx_end - ctx_start
+    if TRIM_CONTEXT:
+        # A windowed drafter only reads context near the prompt end, so each
+        # request stores only that tail of its span, packed after the tails of
+        # the requests before it. The hidden-state gather derives the same
+        # layout from the same inputs.
+        ctx_tail_len = _context_tail_length(
+            target_query_start_loc_ptr,
+            target_positions_ptr,
+            idx_mapping_ptr,
+            prefill_lens_ptr,
+            req_idx,
+            req_idx >= 0,
+            max_context_tail_len,
+        )
+        ctx_dst_start = _cumulative_context_tail_length(
+            target_query_start_loc_ptr,
+            target_positions_ptr,
+            idx_mapping_ptr,
+            prefill_lens_ptr,
+            req_idx,
+            max_context_tail_len,
+            BLOCK_R,
+        )
+    else:
+        ctx_tail_len = num_ctx
+        ctx_dst_start = ctx_start
+    num_trimmed = num_ctx - ctx_tail_len
 
     num_rejected = tl.load(num_rejected_ptr + req_idx)
     valid_ctx_end = ctx_end - num_rejected
@@ -577,13 +921,15 @@ def _prepare_dflash_inputs_kernel(
         local_ctx_slot,
         PAD_SLOT_ID,
     )
-    # Stored over the full [0, num_ctx) span while the loads above are masked to
-    # [0, num_valid_ctx): the rejected suffix rows in between get position 0 and
-    # PAD_SLOT_ID. That is intentional — those rows write no KV and their
-    # positions are never consumed, but the span must stay fully initialized so
-    # a replayed graph cannot observe a stale value from an earlier batch.
-    tl.store(out_context_positions_ptr + ctx_start + j, ctx_pos, mask=is_ctx)
-    tl.store(out_context_slot_mapping_ptr + ctx_start + j, ctx_slot, mask=is_ctx)
+    # Stored over the kept tail of the span while the loads above are masked to
+    # [0, num_valid_ctx): the rejected suffix rows (always inside the tail) get
+    # position 0 and PAD_SLOT_ID. That is intentional — those rows write no KV
+    # and their positions are never consumed, but the tail must stay fully
+    # initialized so a stale value from an earlier batch is never observed.
+    is_kept = is_ctx & (j >= num_trimmed)
+    ctx_dst = ctx_dst_start + j - num_trimmed
+    tl.store(out_context_positions_ptr + ctx_dst, ctx_pos, mask=is_kept)
+    tl.store(out_context_slot_mapping_ptr + ctx_dst, ctx_slot, mask=is_kept)
 
     # --- Query positions / input_ids / slots ---
     query_pos = last_valid_pos + 1 + query_off
@@ -718,9 +1064,13 @@ def prepare_dflash_inputs(
     max_num_tokens: int,
     max_model_len: int,
     sample_from_anchor: bool = False,
+    prefill_len: torch.Tensor | None = None,
+    context_tail_len: int | None = None,
 ) -> None:
     num_reqs = input_batch.num_reqs
     assert num_reqs > 0
+    trim_context = context_tail_len is not None
+    assert not trim_context or prefill_len is not None
     # Cover the longest possible per-request span (ctx + query). Use the max
     # per-request query length, not the total token count across the batch.
     max_target_query_len = int(input_batch.num_scheduled_tokens.max())
@@ -759,9 +1109,14 @@ def prepare_dflash_inputs(
         max_num_tokens,
         max_model_len,
         cp_rank,
+        # Never dereferenced unless TRIM_CONTEXT; any valid pointer will do.
+        prefill_len if prefill_len is not None else input_batch.query_start_loc,
+        context_tail_len or 0,
         SAMPLE_FROM_ANCHOR=sample_from_anchor,
         PAD_SLOT_ID=PAD_SLOT_ID,
         CP_SIZE=cp_size,
         CP_INTERLEAVE=cp_interleave,
         BLOCK_SIZE=BLOCK_SIZE,
+        TRIM_CONTEXT=trim_context,
+        BLOCK_R=_COMPACT_BLOCK_R,
     )

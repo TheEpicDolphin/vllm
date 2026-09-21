@@ -270,9 +270,25 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.speculator = None
         self.use_aux_hidden_state_outputs = False
         self.num_speculative_steps = vllm_config.num_speculative_tokens
+
+        num_prefill_lookahead = max(1, vllm_config.num_prefill_lookahead_tokens)
+
+        # General request states.
+        self.req_states = RequestState(
+            max_num_reqs=self.max_num_reqs,
+            max_model_len=self.max_model_len,
+            max_num_batched_tokens=self.max_num_tokens,
+            num_speculative_steps=self.num_speculative_steps,
+            vocab_size=self.vocab_size,
+            device=self.device,
+            num_prefill_lookahead=num_prefill_lookahead,
+        )
+
         if self.speculative_config is not None:
             if self.is_last_pp_rank:
-                self.speculator = init_speculator(self.vllm_config, self.device)
+                self.speculator = init_speculator(
+                    self.vllm_config, self.device, self.req_states
+                )
 
             if self.speculative_config.method in (
                 "eagle3",
@@ -292,20 +308,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.is_pooling_model = self.model_config.runner_type == "pooling"
         self.pooling_runner: PoolingRunner | None = None
 
-        num_prefill_lookahead = max(1, vllm_config.num_prefill_lookahead_tokens)
-
         self.step_timing = StepTimingCollector()
-
-        # General request states.
-        self.req_states = RequestState(
-            max_num_reqs=self.max_num_reqs,
-            max_model_len=self.max_model_len,
-            max_num_batched_tokens=self.max_num_tokens,
-            num_speculative_steps=self.num_speculative_steps,
-            vocab_size=self.vocab_size,
-            device=self.device,
-            num_prefill_lookahead=num_prefill_lookahead,
-        )
         self.adaptive_verification: AdaptiveVerificationManager | None = None
         self.input_buffers = InputBuffers(
             max_num_reqs=self.max_num_reqs,
