@@ -310,7 +310,7 @@ def test_candidate_generation_routes_scores_and_adaptive_inputs(monkeypatch, lil
 
     key = "lilicorr_candidate_topk" if lilicorr else "selector_top_k"
 
-    def init_base(self, config, device):
+    def init_base(self, config, device, req_states):
         self.draft_model_config = SimpleNamespace(
             hf_config=SimpleNamespace(hidden_size=4, dflash_config={key: 4})
         )
@@ -321,7 +321,7 @@ def test_candidate_generation_routes_scores_and_adaptive_inputs(monkeypatch, lil
 
     monkeypatch.setattr(DFlashSpeculator, "__init__", init_base)
     cls = LiLiCorrSpeculator if lilicorr else DFlash2Speculator
-    spec = cls(None, torch.device("cpu"))
+    spec = cls(None, torch.device("cpu"), None)
     hidden = torch.arange(36).float().view(9, 4)
     spec._run_model = lambda *args: hidden
     spec.sample_indices = torch.tensor([1, 2, 4, 5, 7, 8])

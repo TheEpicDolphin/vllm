@@ -9,14 +9,17 @@ from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmb
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import DFlash2Speculator
 from vllm.v1.worker.gpu.spec_decode.eagle.utils import get_target_lm_head
+from vllm.v1.worker.gpu.states import RequestState
 
 
 class LiLiCorrSpeculator(DFlash2Speculator):
     _speculator_name = "LiLiCorr"
     _candidate_top_k_key = "lilicorr_candidate_topk"
 
-    def __init__(self, vllm_config: VllmConfig, device: torch.device):
-        super().__init__(vllm_config, device)
+    def __init__(
+        self, vllm_config: VllmConfig, device: torch.device, req_states: RequestState
+    ):
+        super().__init__(vllm_config, device, req_states)
         config = self.draft_model_config.hf_config
         self.anchor_hidden = torch.zeros(
             self.max_num_reqs, config.hidden_size, dtype=self.dtype, device=device

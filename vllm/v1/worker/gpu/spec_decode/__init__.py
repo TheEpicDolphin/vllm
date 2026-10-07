@@ -30,24 +30,24 @@ def init_speculator(
                 LiLiCorrSpeculator,
             )
 
-            return LiLiCorrSpeculator(vllm_config, device)
+            return LiLiCorrSpeculator(vllm_config, device, req_states)
         if "DFlash2DraftModel" in speculative_config.draft_model_config.architectures:
             from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import (
                 DFlash2Speculator,
             )
 
-            return DFlash2Speculator(vllm_config, device)
+            return DFlash2Speculator(vllm_config, device, req_states)
         from vllm.v1.worker.gpu.spec_decode.dflash.speculator import (
             DFlashSpeculator,
         )
 
-        return DFlashSpeculator(vllm_config, device)
+        return DFlashSpeculator(vllm_config, device, req_states)
     elif speculative_config.method == "dspark":
         from vllm.v1.worker.gpu.spec_decode.dspark.speculator import (
             DSparkSpeculator,
         )
 
-        return DSparkSpeculator(vllm_config, device)
+        return DSparkSpeculator(vllm_config, device, req_states)
     elif speculative_config.use_gemma4_mtp():
         from vllm.v1.worker.gpu.spec_decode.gemma4.speculator import (
             Gemma4Speculator,

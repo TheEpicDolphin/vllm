@@ -88,7 +88,7 @@ def test_draft_context_parallelism_without_changing_target(
 
     monkeypatch.setattr(DraftModelSpeculator, "__init__", capture_init)
     with pytest.raises(CapturedConfig) as captured:
-        DFlashSpeculator(target_config, device=None)
+        DFlashSpeculator(target_config, device=None, req_states=None)
     draft_parallel = captured.value.args[0].parallel_config
     assert draft_parallel.tensor_parallel_size == 4
     assert draft_parallel.prefill_context_parallel_size == 1

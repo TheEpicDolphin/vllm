@@ -10,6 +10,7 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.triton_utils import tl, triton
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_noised_argmax
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
+from vllm.v1.worker.gpu.states import RequestState
 
 
 @triton.jit
@@ -189,8 +190,10 @@ class DFlash2Speculator(DFlashSpeculator):
     _speculator_name = "DFlash2"
     _candidate_top_k_key = "selector_top_k"
 
-    def __init__(self, vllm_config: VllmConfig, device: torch.device):
-        super().__init__(vllm_config, device)
+    def __init__(
+        self, vllm_config: VllmConfig, device: torch.device, req_states: RequestState
+    ):
+        super().__init__(vllm_config, device, req_states)
         draft_config = self.draft_model_config.hf_config.dflash_config
         self.top_k = int(draft_config[self._candidate_top_k_key])
         self.candidate_sampler = CandidateSampler(

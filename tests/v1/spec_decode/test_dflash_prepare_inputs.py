@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -92,6 +92,12 @@ def _run_prepare(
         seeds=seeds,
         hidden_states=torch.zeros(4, 1, device=device),
         prepare_context_anchor=lambda *args: None,
+        req_states=SimpleNamespace(
+            prefill_len=SimpleNamespace(
+                gpu=torch.zeros(max_num_reqs, dtype=torch.int32, device=device)
+            )
+        ),
+        max_sliding_window=None,
         query_cudagraph_manager=None,
         dp_size=1,
         dp_rank=0,
@@ -116,6 +122,8 @@ def _run_prepare(
         max_model_len=128,
         sample_from_anchor=True,
     )
+    draft._copy_context = MethodType(DFlashSpeculator._copy_context, draft)
+    draft._copy_context_full = MethodType(DFlashSpeculator._copy_context_full, draft)
     with (
         patch(
             "vllm.v1.worker.gpu.spec_decode.dflash.speculator.dispatch_cg_and_sync_dp",
