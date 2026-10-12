@@ -1350,10 +1350,12 @@ class MooncakeConnectorWorker:
         # physical block sizes. Pick the common (smallest) block size so that
         # KV-cache registration and transfer work correctly for both models.
         backends = get_current_attn_backends(self.vllm_config)
-        backends, specs = get_current_attn_backends_and_specs(
+        backends, specs, layer_names = get_current_attn_backends_and_specs(
             self.vllm_config, self.kv_cache_config, backends
         )
-        kernel_block_size = select_common_block_size(self.block_size, backends, specs)
+        kernel_block_size = select_common_block_size(
+            self.block_size, backends, specs, layer_names
+        )
         if self.block_size != kernel_block_size:
             logger.info_once(
                 "User-specified logical block size (%s) does not match"

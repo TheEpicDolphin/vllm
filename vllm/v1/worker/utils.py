@@ -293,7 +293,7 @@ class AttentionGroup:
             # A backend in a packed KV cache group may need smaller blocks than
             # the group is split into.
             kernel_block_size = select_common_block_size(
-                kernel_block_size, [self.backend], [spec]
+                kernel_block_size, [self.backend], [spec], [self.layer_names]
             )
             if kernel_block_size != spec.block_size:
                 self.kernel_block_size = kernel_block_size
@@ -473,13 +473,25 @@ def map_kv_caches_to_kernel_blocks(
     return mapped
 
 
+def _supported_kernel_block_sizes(
+    backend: type[AttentionBackend],
+    spec: KVCacheSpec | None,
+    layer_names: list[str] | None,
+) -> list[int | MultipleOf]:
+    if layer_names is None:
+        return backend.get_supported_kernel_block_sizes(spec)
+    return backend.get_supported_kernel_block_sizes_for_layers(spec, layer_names)
+
+
 def customize_attention_spec(
-    backend: type[AttentionBackend], spec: AttentionSpec
+    backend: type[AttentionBackend],
+    spec: AttentionSpec,
+    layer_names: list[str] | None = None,
 ) -> AttentionSpec:
     """The backend's spec. Blocks larger than every kernel block size a backend
     takes are split into kernel blocks, which packed blocks must keep whole."""
     spec = backend.customize_spec(spec)
-    sizes = backend.get_supported_kernel_block_sizes(spec)
+    sizes = _supported_kernel_block_sizes(backend, spec, layer_names)
     fixed_sizes = [s for s in sizes if isinstance(s, int)]
     if spec.block_stride_alignment is None and sizes and fixed_sizes == sizes:
         spec = replace(spec, block_stride_alignment=MultipleOf(max(fixed_sizes)))
@@ -490,15 +502,16 @@ def _block_size_is_supported(
     backends: list[type[AttentionBackend]],
     block_size: int,
     specs: Sequence[KVCacheSpec | None],
+    layer_names: Sequence[list[str] | None],
 ) -> bool:
     """Check if the block size is supported by all backends.
 
     An exact ``int`` declaration must match exactly; a ``MultipleOf``
     declaration accepts any multiple of its base.
     """
-    for backend, spec in zip(backends, specs, strict=True):
+    for backend, spec, names in zip(backends, specs, layer_names, strict=True):
         is_supported = False
-        for supported_size in backend.get_supported_kernel_block_sizes(spec):
+        for supported_size in _supported_kernel_block_sizes(backend, spec, names):
             if isinstance(supported_size, int):
                 if block_size == supported_size:
                     is_supported = True
@@ -516,6 +529,7 @@ def select_common_block_size(
     kv_manager_block_size: int,
     backends: list[type[AttentionBackend]],
     kv_cache_specs: Sequence[KVCacheSpec | None] | None = None,
+    layer_names: Sequence[list[str] | None] | None = None,
 ) -> int:
     """Select a block size that is supported by all backends and is a factor of
     kv_manager_block_size.
@@ -527,6 +541,8 @@ def select_common_block_size(
         kv_manager_block_size: Block size of KV cache.
         backends: List of attention backend classes.
         kv_cache_specs: Per-backend cache specs for spec-specific constraints.
+        layer_names: Per-backend attention layers, for layer-specific
+            constraints.
 
     Returns:
         The selected block size.
@@ -536,26 +552,27 @@ def select_common_block_size(
 
     """
     specs = kv_cache_specs or [None] * len(backends)
-    if _block_size_is_supported(backends, kv_manager_block_size, specs):
+    names = layer_names or [None] * len(backends)
+    if _block_size_is_supported(backends, kv_manager_block_size, specs, names):
         return kv_manager_block_size
 
     # MultipleOf constraints also accept the manager size if they accept a divisor.
     # Any remaining candidate must therefore be an explicit size from a backend.
     candidates = {
         size
-        for backend, spec in zip(backends, specs, strict=True)
-        for size in backend.get_supported_kernel_block_sizes(spec)
+        for backend, spec, layers in zip(backends, specs, names, strict=True)
+        for size in _supported_kernel_block_sizes(backend, spec, layers)
         if isinstance(size, int) and kv_manager_block_size % size == 0
     }
 
     for size in sorted(candidates, reverse=True):
-        if _block_size_is_supported(backends, size, specs):
+        if _block_size_is_supported(backends, size, specs, names):
             return size
     raise ValueError(
         f"No common block size for {kv_manager_block_size} ("
         + "; ".join(
-            f"{b.get_name()}: {b.get_supported_kernel_block_sizes(s)}"
-            for b, s in zip(backends, specs, strict=True)
+            f"{b.get_name()}: {_supported_kernel_block_sizes(b, s, n)}"
+            for b, s, n in zip(backends, specs, names, strict=True)
         )
         + ")."
     )
@@ -660,6 +677,7 @@ def prepare_kernel_block_sizes(
             kv_manager_block_size = kv_cache_group.kv_cache_spec.block_size
             group_backends = [g.backend for g in attn_groups[kv_cache_gid]]
             group_specs = [g.kv_cache_spec for g in attn_groups[kv_cache_gid]]
+            group_layer_names = [g.layer_names for g in attn_groups[kv_cache_gid]]
             # Block-outermost packing puts other layers' pages between the
             # blocks, so they are never split group-wide.
             selected_kernel_size = (
@@ -670,7 +688,10 @@ def prepare_kernel_block_sizes(
                     if not set(t.layers).isdisjoint(kv_cache_group.layer_names)
                 )
                 else select_common_block_size(
-                    kv_manager_block_size, group_backends, group_specs
+                    kv_manager_block_size,
+                    group_backends,
+                    group_specs,
+                    group_layer_names,
                 )
             )
             kernel_block_sizes.append(selected_kernel_size)

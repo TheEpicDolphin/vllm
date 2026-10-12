@@ -37,7 +37,7 @@ from vllm.sampling_params import SamplingParams
 from vllm.utils.mem_constants import GiB_bytes
 from vllm.utils.system_utils import update_environment_variables
 from vllm.utils.torch_utils import set_random_seed
-from vllm.v1.attention.backend import MultipleOf
+from vllm.v1.attention.backend import AttentionCGSupport, MultipleOf
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerBackend
 from vllm.v1.attention.backends.mla.rocm_aiter_mla_sparse import (
     ROCMAiterMLASparseBackend,
@@ -338,6 +338,85 @@ def test_select_common_block_size_accepts_rocm_sparse_block_size_16(monkeypatch)
         [DeepseekV32IndexerBackend, ROCMAiterMLASparseBackend],
     )
     assert selected_size == 16
+
+
+def _flashinfer_with_draft_layer(monkeypatch, draft_num_heads: int):
+    """FlashInfer on Blackwell under a GQA target (24 query / 4 KV heads) with
+    one registered draft layer, "draft.attn", of ``draft_num_heads`` query heads
+    over 40 KV heads."""
+    pytest.importorskip("flashinfer")
+    import vllm.v1.attention.backends.flashinfer as flashinfer_module
+    from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+
+    draft_layer = Mock(spec=AttentionLayerBase)
+    draft_layer.impl = SimpleNamespace(num_heads=draft_num_heads)
+    vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+        attention_config=SimpleNamespace(use_non_causal=False),
+        model_config=SimpleNamespace(
+            get_num_attention_heads=lambda _: 24,
+            get_num_kv_heads=lambda _: 4,
+        ),
+        compilation_config=SimpleNamespace(
+            static_forward_context={"draft.attn": draft_layer}
+        ),
+    )
+    monkeypatch.setattr(
+        flashinfer_module, "get_current_vllm_config_or_none", lambda: vllm_config
+    )
+    monkeypatch.setattr(current_platform, "is_device_capability", lambda _: False)
+    monkeypatch.setattr(
+        current_platform, "is_device_capability_family", lambda family: family == 100
+    )
+    monkeypatch.setattr(
+        flashinfer_module,
+        "can_use_trtllm_attention",
+        lambda num_qo_heads, num_kv_heads, is_prefill=False: (
+            num_qo_heads % num_kv_heads == 0
+        ),
+    )
+    spec = FullAttentionSpec(
+        block_size=512, num_kv_heads=40, head_size=128, dtype=torch.bfloat16
+    )
+    return flashinfer_module, vllm_config, spec
+
+
+@pytest.mark.parametrize("draft_num_heads,expected_block_size", [(40, 64), (160, 512)])
+def test_flashinfer_block_size_follows_layer_heads(
+    monkeypatch, draft_num_heads, expected_block_size
+):
+    """A group's FlashInfer page size comes from its own layers' heads, not the
+    target model's: an MHA draft on a GQA target cannot take the large pages
+    only trtllm-gen GQA serves."""
+    flashinfer_module, _, spec = _flashinfer_with_draft_layer(
+        monkeypatch, draft_num_heads
+    )
+    backend = flashinfer_module.FlashInferBackend
+
+    assert select_common_block_size(512, [backend], [spec]) == 512
+    assert (
+        select_common_block_size(512, [backend], [spec], [["draft.attn"]])
+        == expected_block_size
+    )
+
+
+def test_flashinfer_cudagraph_support_ignores_model_heads(monkeypatch):
+    """A draft group keeps uniform-batch CUDA graphs under a target whose
+    query heads are not a multiple of the draft's KV heads; pairing the two
+    would rule out trtllm-gen and drop the engine to piecewise graphs."""
+    flashinfer_module, vllm_config, spec = _flashinfer_with_draft_layer(
+        monkeypatch, draft_num_heads=40
+    )
+    monkeypatch.setattr(flashinfer_module, "force_use_trtllm_attention", lambda: None)
+    monkeypatch.setattr(
+        flashinfer_module, "supports_trtllm_attention", lambda is_prefill: True
+    )
+    builder_cls = flashinfer_module.FlashInferMetadataBuilder
+
+    assert (
+        builder_cls.get_cudagraph_support(vllm_config, spec)
+        == AttentionCGSupport.UNIFORM_BATCH
+    )
 
 
 def test_reasoning_config_without_custom_logitsprocs_does_not_need_output_token_ids(

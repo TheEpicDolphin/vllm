@@ -86,6 +86,7 @@ def test_get_kv_cache_spec_resolves_hisparse_block_size(
             get_name=lambda name=name: name,
             customize_spec=AttentionBackend.customize_spec,
             get_supported_kernel_block_sizes=lambda _=None, sizes=sizes: sizes,
+            get_supported_kernel_block_sizes_for_layers=lambda *_, sizes=sizes: sizes,
         )
         layers[name] = SimpleNamespace(
             get_kv_cache_spec=lambda _, spec=specs[name]: spec,
@@ -779,6 +780,7 @@ def _packed_group(tokens_per_state, row_bytes, supported_sizes):
     backend = SimpleNamespace(
         get_builder_cls=lambda: _TableBuilder,
         get_supported_kernel_block_sizes=lambda _=None: supported_sizes,
+        get_supported_kernel_block_sizes_for_layers=lambda *_: supported_sizes,
         get_name=lambda: "FAKE",
         customize_spec=lambda spec: spec,
     )

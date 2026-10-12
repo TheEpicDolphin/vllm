@@ -73,7 +73,24 @@ class AttentionBackend(ABC):
     def get_supported_kernel_block_sizes(
         kv_cache_spec: "KVCacheSpec | None" = None,
     ) -> list[int | MultipleOf]:
+        """Kernel block sizes this backend can serve, independent of any
+        attention group. Used for backend selection; to size a group, call
+        get_supported_kernel_block_sizes_for_layers instead."""
         return [MultipleOf(1)]
+
+    @classmethod
+    def get_supported_kernel_block_sizes_for_layers(
+        cls,
+        kv_cache_spec: "KVCacheSpec | None",
+        layer_names: list[str],
+    ) -> list[int | MultipleOf]:
+        """Kernel block sizes this backend can serve for the given layers.
+
+        Override when the answer depends on the layers themselves rather than
+        the model config (e.g. a draft whose head layout differs from the
+        target's).
+        """
+        return cls.get_supported_kernel_block_sizes(kv_cache_spec)
 
     @staticmethod
     @abstractmethod

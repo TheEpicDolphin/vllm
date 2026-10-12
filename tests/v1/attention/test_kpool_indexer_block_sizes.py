@@ -57,7 +57,10 @@ def _prepare(
         kv_cache_tensors=[],
     )
     attn_groups = [
-        [SimpleNamespace(backend=backend, kv_cache_spec=spec) for backend in backends]
+        [
+            SimpleNamespace(backend=backend, kv_cache_spec=spec, layer_names=[])
+            for backend in backends
+        ]
     ]
     return prepare_kernel_block_sizes(kv_cache_config, attn_groups)
 
@@ -92,7 +95,7 @@ def test_prepare_uses_the_backend_vote():
 
     class Fixed64Backend:
         @staticmethod
-        def get_supported_kernel_block_sizes(kv_cache_spec=None):
+        def get_supported_kernel_block_sizes_for_layers(kv_cache_spec, layer_names):
             return [64]
 
         @staticmethod
@@ -111,7 +114,7 @@ def test_prepare_uses_the_backend_vote():
     # exactly as on main.
     class AcceptAllBackend:
         @staticmethod
-        def get_supported_kernel_block_sizes(kv_cache_spec=None):
+        def get_supported_kernel_block_sizes_for_layers(kv_cache_spec, layer_names):
             return [MultipleOf(1)]
 
         @staticmethod
