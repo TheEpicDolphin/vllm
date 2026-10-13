@@ -43,6 +43,7 @@ class EAGLEConfig(PreTrainedConfig):
         # LlamaForCausalLM -> EagleLlamaForCausalLM
         # LlamaForCausalLM -> Eagle3LlamaForCausalLM
         # LlamaForCausalLMEagle3 -> LlamaForCausalLMEagle3
+        # LlamaForCausalLMEagle4 -> LlamaForCausalLMEagle4
         if method == "eagle":
             assert self.model is not None, (
                 "model should not be None when method is eagle"
@@ -58,7 +59,7 @@ class EAGLEConfig(PreTrainedConfig):
             )
             kwargs["architectures"] = [
                 arch
-                if arch.startswith("Eagle3") or arch.endswith("Eagle3")
+                if arch.startswith("Eagle3") or arch.endswith(("Eagle3", "Eagle4"))
                 else f"Eagle3{arch}"
                 for arch in self.model.architectures
             ]

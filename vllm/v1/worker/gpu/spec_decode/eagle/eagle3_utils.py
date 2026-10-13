@@ -104,6 +104,12 @@ def get_eagle3_aux_layers_from_config(
         return None
     hf_config = spec_config.draft_model_config.hf_config
     layer_ids = getattr(hf_config, "eagle_aux_hidden_state_layer_ids", None)
+    architectures = getattr(hf_config, "architectures", None) or ()
+    if not layer_ids and any(arch.endswith("Eagle4") for arch in architectures):
+        eagle_config = getattr(hf_config, "eagle_config", None) or {}
+        layer_ids = [
+            i + 1 for i in (eagle_config.get("eagle_aux_hidden_state_layer_ids") or [])
+        ]
     if not layer_ids:
         dflash_config = getattr(hf_config, "dflash_config", None)
         if dflash_config and isinstance(dflash_config, dict):
