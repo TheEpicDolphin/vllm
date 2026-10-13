@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import abc
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from typing import Any, ClassVar, TypeVar
 
@@ -15,6 +16,7 @@ from vllm.v1.attention.backend import (
     AttentionCGSupport,
     AttentionMetadataBuilder,
     CommonAttentionMetadata,
+    build_group,
 )
 from vllm.v1.attention.backends.utils import (
     NULL_BLOCK_ID,
@@ -722,6 +724,41 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
             replayssm_scratch=replayssm_scratch,
             replayssm_state_indices_d=replayssm_state_indices_d,
         )
+
+    def build_grouped(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        builders: Sequence[AttentionMetadataBuilder[M]],
+        block_tables: Sequence[torch.Tensor],
+        slot_mappings: Sequence[torch.Tensor],
+        for_cudagraph_capture: bool = False,
+        **kwargs: Any,
+    ) -> list[M]:
+        if not self.supports_update_block_table:
+            return super().build_grouped(
+                common_attn_metadata,
+                builders,
+                block_tables,
+                slot_mappings,
+                for_cudagraph_capture,
+                **kwargs,
+            )
+        # Later groups re-gather their state indices from the first group's
+        # metadata. Also at capture, so FULL graphs share batch-level buffers.
+        first = build_group(
+            self,
+            common_attn_metadata,
+            block_tables[0],
+            slot_mappings[0],
+            for_cudagraph_capture,
+            **kwargs,
+        )
+        return [first] + [
+            builder.update_block_table(first, block_table, slot_mapping)
+            for builder, block_table, slot_mapping in zip(
+                builders[1:], block_tables[1:], slot_mappings[1:], strict=True
+            )
+        ]
 
     def update_block_table(
         self,

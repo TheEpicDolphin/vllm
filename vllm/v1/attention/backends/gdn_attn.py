@@ -2,8 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Backend for GatedDeltaNet attention."""
 
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
-from typing import Literal
+from typing import Any, Literal
 
 import torch
 
@@ -13,12 +14,14 @@ from vllm.model_executor.layers.mamba.checkpoint import (
     MambaPrefillCheckpointBuilder,
     MambaPrefillCheckpointMetadata,
 )
+from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
     AttentionMetadataBuilder,
     CommonAttentionMetadata,
+    build_group,
 )
 from vllm.v1.attention.backends.utils import (
     NULL_BLOCK_ID,
@@ -27,6 +30,31 @@ from vllm.v1.attention.backends.utils import (
     split_decodes_and_prefills,
 )
 from vllm.v1.kv_cache_interface import MambaSpec
+
+
+@triton.jit
+def _gather_group_state_indices_kernel(
+    block_table_ptrs,
+    block_table_strides,
+    state_indices_ptrs,
+    state_indices_stride,
+    num_valid_rows,
+    NULL_ID: tl.constexpr,
+    NUM_COLS: tl.constexpr,
+    BLOCK_COLS: tl.constexpr,
+):
+    group = tl.program_id(0)
+    row = tl.program_id(1)
+    cols = tl.arange(0, BLOCK_COLS)
+    mask = cols < NUM_COLS
+    state_indices = tl.load(state_indices_ptrs + group).to(tl.pointer_type(tl.int32))
+    if row < num_valid_rows:
+        block_table = tl.load(block_table_ptrs + group).to(tl.pointer_type(tl.int32))
+        block_table_stride = tl.load(block_table_strides + group)
+        values = tl.load(block_table + row * block_table_stride + cols, mask=mask)
+    else:
+        values = tl.full((BLOCK_COLS,), NULL_ID, tl.int32)
+    tl.store(state_indices + row * state_indices_stride + cols, values, mask=mask)
 
 
 class GDNAttentionBackend(AttentionBackend):
@@ -150,6 +178,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 self.compilation_config.max_cudagraph_capture_size,
             )
 
+        self._group_pointer_cache: dict[tuple[tuple[int, int], ...], torch.Tensor] = {}
         self.spec_state_indices_tensor: torch.Tensor = torch.empty(
             (self.decode_cudagraph_max_bs, self.num_spec + 1),
             dtype=torch.int32,
@@ -655,6 +684,113 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             and num_spec_decodes == 0
             and num_decodes <= self.decode_cudagraph_max_bs
         )
+
+    def build_grouped(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        builders: Sequence[AttentionMetadataBuilder[GDNAttentionMetadata]],
+        block_tables: Sequence[torch.Tensor],
+        slot_mappings: Sequence[torch.Tensor],
+        for_cudagraph_capture: bool = False,
+        **kwargs: Any,
+    ) -> list[GDNAttentionMetadata]:
+        if not self.supports_update_block_table or len(builders) == 1:
+            return super().build_grouped(
+                common_attn_metadata,
+                builders,
+                block_tables,
+                slot_mappings,
+                for_cudagraph_capture,
+                **kwargs,
+            )
+        m = build_group(
+            self,
+            common_attn_metadata,
+            block_tables[0],
+            slot_mappings[0],
+            for_cudagraph_capture,
+            **kwargs,
+        )
+        others: list[GDNAttentionMetadataBuilder] = list(builders[1:])  # type: ignore[arg-type]
+        stage_spec = self._stage_spec_decode(
+            m.num_prefills, m.num_decodes, m.num_spec_decodes, m.num_spec_decode_tokens
+        )
+        stage_decode = self._stage_decode(
+            m.num_prefills, m.num_decodes, m.num_spec_decodes
+        )
+        if (
+            m.checkpoint is not None
+            or self.vllm_config.cache_config.mamba_cache_mode == "align"
+            or not (stage_spec or stage_decode)
+        ):
+            return [m] + [
+                builder.update_block_table(m, block_table, slot_mapping)
+                for builder, block_table, slot_mapping in zip(
+                    others, block_tables[1:], slot_mappings[1:], strict=True
+                )
+            ]
+        # The FULL cudagraph cases: every group's state indices are rows of its
+        # block table, copied into its builder's persistent buffer at once.
+        if stage_spec:
+            assert m.spec_state_indices_tensor is not None
+            state_indices = [builder.spec_state_indices_tensor for builder in others]
+            num_valid_rows, num_cols = m.num_spec_decodes, self.num_spec + 1
+            batch_size = m.spec_state_indices_tensor.shape[0]
+        else:
+            assert m.non_spec_state_indices_tensor is not None
+            state_indices = [
+                builder.non_spec_state_indices_tensor for builder in others
+            ]
+            num_valid_rows, num_cols = m.num_decodes, 1
+            batch_size = m.non_spec_state_indices_tensor.shape[0]
+        block_table_ptrs, block_table_strides, state_indices_ptrs = (
+            self._group_pointers(block_tables[1:], state_indices)
+        )
+        _gather_group_state_indices_kernel[(len(others), batch_size)](
+            block_table_ptrs,
+            block_table_strides,
+            state_indices_ptrs,
+            state_indices[0].stride(0),
+            num_valid_rows,
+            NULL_ID=NULL_BLOCK_ID,
+            NUM_COLS=num_cols,
+            BLOCK_COLS=triton.next_power_of_2(num_cols),
+        )
+        return [m] + [
+            replace(
+                m,
+                spec_state_indices_tensor=indices if stage_spec else None,
+                non_spec_state_indices_tensor=None if stage_spec else indices,
+                prefill_state_indices=None,
+                checkpoint=None,
+            )
+            for indices in (t[:batch_size] for t in state_indices)
+        ]
+
+    def _group_pointers(
+        self,
+        block_tables: Sequence[torch.Tensor],
+        state_indices: Sequence[torch.Tensor],
+    ) -> torch.Tensor:
+        # The block tables and state index buffers are persistent, so this
+        # misses once per group set; strides are keyed in case one is not.
+        key = tuple(
+            (t.data_ptr(), t.stride(0)) for t in (*block_tables, *state_indices)
+        )
+        pointers = self._group_pointer_cache.get(key)
+        if pointers is None:
+            assert all(t.dtype == torch.int32 for t in (*block_tables, *state_indices))
+            pointers = async_tensor_h2d(
+                [
+                    [t.data_ptr() for t in block_tables],
+                    [t.stride(0) for t in block_tables],
+                    [t.data_ptr() for t in state_indices],
+                ],
+                self.device,
+                torch.int64,
+            )
+            self._group_pointer_cache[key] = pointers
+        return pointers
 
     def update_block_table(
         self,

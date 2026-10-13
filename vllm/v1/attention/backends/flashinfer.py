@@ -2,10 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Attention layer with FlashInfer."""
 
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from enum import Enum
 from functools import partial
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import numpy as np
 import torch
@@ -70,6 +71,7 @@ from vllm.v1.attention.backend import (
     AttentionType,
     CommonAttentionMetadata,
     MultipleOf,
+    build_group,
     max_decode_query_len,
 )
 from vllm.v1.attention.backends.utils import (
@@ -1849,6 +1851,64 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 )
                 attn_metadata.decode = FIDecode(wrapper=decode_wrapper)
         return attn_metadata
+
+    def build_grouped(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        builders: Sequence[AttentionMetadataBuilder[FlashInferMetadata]],
+        block_tables: Sequence[torch.Tensor],
+        slot_mappings: Sequence[torch.Tensor],
+        for_cudagraph_capture: bool = False,
+        **kwargs: Any,
+    ) -> list[FlashInferMetadata]:
+        m = build_group(
+            self,
+            common_attn_metadata,
+            block_tables[0],
+            slot_mappings[0],
+            for_cudagraph_capture,
+            **kwargs,
+        )
+        # trtllm-gen and XQA read the block table directly; the native wrappers
+        # are planned from page indices derived from it, and FP8 prefill
+        # dequantization trims it.
+        if (
+            isinstance(m.prefill, FIPrefill)
+            or isinstance(m.decode, FIDecode)
+            or (
+                m.prefill is not None
+                and self.q_data_type_prefill != FP8_DTYPE
+                and self.cache_dtype.startswith("fp8")
+            )
+        ):
+            return [m] + [
+                build_group(
+                    builder,
+                    common_attn_metadata,
+                    block_table,
+                    slot_mapping,
+                    for_cudagraph_capture,
+                    **kwargs,
+                )
+                for builder, block_table, slot_mapping in zip(
+                    builders[1:], block_tables[1:], slot_mappings[1:], strict=True
+                )
+            ]
+        return [m] + [
+            replace(
+                m,
+                slot_mapping=slot_mapping,
+                prefill=replace(m.prefill, block_tables=block_table[m.num_decodes :])
+                if m.prefill is not None
+                else None,
+                decode=replace(m.decode, block_tables=block_table[: m.num_decodes])
+                if m.decode is not None
+                else None,
+            )
+            for block_table, slot_mapping in zip(
+                block_tables[1:], slot_mappings[1:], strict=True
+            )
+        ]
 
     def update_draft_decode_metadata(self, _metadata: FlashInferMetadata) -> None:
         pass

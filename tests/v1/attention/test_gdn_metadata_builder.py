@@ -149,6 +149,7 @@ GDN_BUILD_TEST_CASES = {
 def _create_gdn_builder(
     num_speculative_tokens: int = 0,
     full_cuda_graph: bool = False,
+    device: torch.device = DEVICE,
 ) -> GDNAttentionMetadataBuilder:
     """Create a GDNAttentionMetadataBuilder with minimal config."""
     vllm_config = create_vllm_config(
@@ -172,7 +173,7 @@ def _create_gdn_builder(
         kv_cache_spec=mamba_spec,
         layer_names=["layer.0"],
         vllm_config=vllm_config,
-        device=DEVICE,
+        device=device,
     )
 
 
@@ -186,15 +187,25 @@ def _build(
     common = create_common_attn_metadata(batch_spec, BLOCK_SIZE, DEVICE)
     if block_table is not None:
         common = common.replace(block_table_tensor=block_table)
-    kwargs: dict = {}
-    if num_decode_draft_tokens is not None:
-        kwargs["num_decode_draft_tokens_cpu"] = torch.tensor(
-            num_decode_draft_tokens, dtype=torch.int32
-        )
-        kwargs["num_accepted_tokens"] = torch.ones(
-            batch_spec.batch_size, dtype=torch.int32, device=DEVICE
-        )
+    kwargs = _spec_decode_kwargs(batch_spec, num_decode_draft_tokens, DEVICE)
     return builder.build(common_prefix_len=0, common_attn_metadata=common, **kwargs)
+
+
+def _spec_decode_kwargs(
+    batch_spec: BatchSpec,
+    num_decode_draft_tokens: list[int] | None,
+    device: torch.device,
+) -> dict:
+    if num_decode_draft_tokens is None:
+        return {}
+    return {
+        "num_decode_draft_tokens_cpu": torch.tensor(
+            num_decode_draft_tokens, dtype=torch.int32
+        ),
+        "num_accepted_tokens": torch.ones(
+            batch_spec.batch_size, dtype=torch.int32, device=device
+        ),
+    }
 
 
 @pytest.mark.parametrize(
@@ -260,6 +271,57 @@ def test_update_block_table_matches_build(
         # FULL graph state indices land in this group's own buffers.
         if full_cuda_graph and meta.num_prefills == 0 and actual is not None:
             assert actual.data_ptr() == getattr(dst, field).data_ptr()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+@pytest.mark.parametrize("full_cuda_graph", [False, True])
+@pytest.mark.parametrize(
+    "test_case", GDN_BUILD_TEST_CASES.values(), ids=GDN_BUILD_TEST_CASES.keys()
+)
+def test_build_grouped_matches_build(
+    test_case: GDNBuildTestCase, full_cuda_graph: bool, monkeypatch
+):
+    """build_grouped() gives every group the state indices build() would, in
+    the group's own FULL graph buffers (one fused gather for the decode-only
+    batches, update_block_table() otherwise)."""
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    device = torch.device("cuda")
+    batch = BatchSpec(seq_lens=test_case.seq_lens, query_lens=test_case.query_lens)
+    builders, refs = (
+        [
+            _create_gdn_builder(
+                test_case.num_speculative_tokens, full_cuda_graph, device
+            )
+            for _ in range(3)
+        ]
+        for _ in range(2)
+    )
+    for builder in (*builders, *refs):
+        builder.vllm_config.cache_config.mamba_cache_mode = "none"
+    assert builders[0].supports_update_block_table
+    commons = [create_common_attn_metadata(batch, BLOCK_SIZE, device) for _ in builders]
+    kwargs = _spec_decode_kwargs(batch, test_case.num_decode_draft_tokens, device)
+
+    grouped = builders[0].build_grouped(
+        commons[0],
+        builders,
+        [common.block_table_tensor for common in commons],
+        [common.slot_mapping for common in commons],
+        **kwargs,
+    )
+
+    fields = (
+        "spec_state_indices_tensor",
+        "non_spec_state_indices_tensor",
+        "prefill_state_indices",
+    )
+    for meta, ref, builder, common in zip(grouped, refs, builders, commons):
+        expected = ref.build(common_prefix_len=0, common_attn_metadata=common, **kwargs)
+        for field in fields:
+            actual = getattr(meta, field)
+            torch.testing.assert_close(actual, getattr(expected, field))
+            if full_cuda_graph and meta.num_prefills == 0 and actual is not None:
+                assert actual.data_ptr() == getattr(builder, field).data_ptr()
 
 
 def test_has_initial_state_after_reclassification():

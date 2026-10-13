@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Hashable, Iterable, Mapping, Sequence
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
@@ -32,7 +32,6 @@ from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
-    MambaSpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
@@ -494,20 +493,41 @@ def build_attn_metadata(
 
     attn_metadata: dict[str, Any] = {}
     token_to_req_indices: torch.Tensor | None = None
-    # Mamba groups with the same spec and builder differ only in their state
-    # indices, so later groups re-gather those from the first group's metadata.
-    # Also at capture, so FULL graphs share the batch-level buffers.
-    cached_metadata: dict[tuple[KVCacheSpec, type], Any] = {}
-    num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
-    for i in range(num_kv_cache_groups):
-        if not attn_groups[i]:
-            continue
-        block_table = block_tables[i]
-        slot_mapping = slot_mappings[i]
-        # Per-group causal for hybrid drafters (mixed SWA/full attention).
-        group_causal = (
-            causal if isinstance(causal, (bool, torch.Tensor)) else causal.get(i, True)
-        )
+
+    # Per-group causal for hybrid drafters (mixed SWA/full attention).
+    group_causal = [
+        causal if isinstance(causal, (bool, torch.Tensor)) else causal.get(i, True)
+        for i in range(len(kv_cache_config.kv_cache_groups))
+    ]
+
+    # KV cache groups with the same spec, builder type and causality differ
+    # only in their block tables and slot mappings, so they are built together.
+    buckets: dict[Hashable, list[tuple[int, AttentionGroup]]] = {}
+    for i in range(len(kv_cache_config.kv_cache_groups)):
+        causal_i = group_causal[i]
+        for attn_group in attn_groups[i]:
+            spec = attn_group.kv_cache_spec
+            # Per-layer specs are unhashable, so those groups are built alone.
+            key: Hashable = (
+                (i, id(attn_group))
+                if isinstance(spec, UniformTypeKVCacheSpecs)
+                else (
+                    spec,
+                    type(attn_group.get_metadata_builder(ubatch_idx)),
+                    attn_group.kernel_block_size,
+                    causal_i if isinstance(causal_i, bool) else id(causal_i),
+                )
+            )
+            buckets.setdefault(key, []).append((i, attn_group))
+
+    for bucket in buckets.values():
+        i = bucket[0][0]
+        builders = [group.get_metadata_builder(ubatch_idx) for _, group in bucket]
+        group_block_tables = [
+            group.map_to_kernel_block_table(block_tables[j], ubatch_idx)
+            for j, group in bucket
+        ]
+        group_slot_mappings = [slot_mappings[j] for j, _ in bucket]
 
         common_attn_metadata_extra_kwargs = (
             model_specific_attn_metadata.get_extra_common_attn_kwargs(i, num_reqs)
@@ -534,9 +554,9 @@ def build_attn_metadata(
             num_reqs=num_reqs,
             num_actual_tokens=num_tokens,
             max_query_len=max_query_len,
-            block_table_tensor=block_table,
-            slot_mapping=slot_mapping,
-            causal=group_causal,
+            block_table_tensor=group_block_tables[0],
+            slot_mapping=group_slot_mappings[0],
+            causal=group_causal[i],
             dcp_local_seq_lens=dcp_local_seq_lens,
             dcp_local_seq_lens_cpu_upper_bound=dcp_local_seq_lens_cpu_upper_bound,
             positions=positions,
@@ -547,37 +567,21 @@ def build_attn_metadata(
             _token_to_req_indices_cache=token_to_req_indices,
             **common_attn_metadata_extra_kwargs,
         )
-
-        for attn_group in attn_groups[i]:
-            attn_metadata_builder = attn_group.get_metadata_builder(ubatch_idx)
-            reuse_key = None
-            if attn_metadata_builder.supports_update_block_table and isinstance(
-                attn_group.kv_cache_spec, MambaSpec
-            ):
-                reuse_key = (attn_group.kv_cache_spec, type(attn_metadata_builder))
-            if reuse_key in cached_metadata:
-                metadata = attn_metadata_builder.update_block_table(
-                    cached_metadata[reuse_key], block_table, slot_mapping
-                )
-            elif for_cudagraph_capture:
-                metadata = attn_group.build_metadata_for_cudagraph_capture(
-                    common_attn_metadata, ubatch_idx
-                )
-            else:
-                attn_metadata_extra_kwargs = (
-                    model_specific_attn_metadata.get_extra_attn_kwargs(
-                        attn_metadata_builder,
-                        num_reqs,
-                    )
-                    if model_specific_attn_metadata is not None
-                    else {}
-                )
-                metadata = attn_group.build_metadata(
-                    common_attn_metadata, ubatch_idx, **attn_metadata_extra_kwargs
-                )
-            if reuse_key is not None and reuse_key not in cached_metadata:
-                cached_metadata[reuse_key] = metadata
-            for layer_name in attn_group.layer_names:
+        attn_metadata_extra_kwargs = (
+            model_specific_attn_metadata.get_extra_attn_kwargs(builders[0], num_reqs)
+            if model_specific_attn_metadata is not None and not for_cudagraph_capture
+            else {}
+        )
+        metadatas = builders[0].build_grouped(
+            common_attn_metadata,
+            builders,
+            group_block_tables,
+            group_slot_mappings,
+            for_cudagraph_capture,
+            **attn_metadata_extra_kwargs,
+        )
+        for (_, group), metadata in zip(bucket, metadatas, strict=True):
+            for layer_name in group.layer_names:
                 attn_metadata[layer_name] = metadata
         token_to_req_indices = common_attn_metadata._token_to_req_indices_cache
     return attn_metadata

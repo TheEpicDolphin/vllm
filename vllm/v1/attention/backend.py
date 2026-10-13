@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from enum import Enum
 from typing import TYPE_CHECKING, Any, ClassVar, Generic, Protocol, TypeVar
@@ -731,6 +732,35 @@ class AttentionMetadataBuilder(ABC, Generic[M]):
         """
         raise NotImplementedError
 
+    def build_grouped(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        builders: "Sequence[AttentionMetadataBuilder[M]]",
+        block_tables: Sequence[torch.Tensor],
+        slot_mappings: Sequence[torch.Tensor],
+        for_cudagraph_capture: bool = False,
+        **kwargs: Any,
+    ) -> list[M]:
+        """Build metadata for KV cache groups that share this builder's type
+        and KV cache spec, and differ only in block tables and slot mappings.
+
+        ``builders[0]`` is ``self``, and ``common_attn_metadata`` carries its
+        block table and slot mapping. Override to share work across groups.
+        """
+        return [
+            build_group(
+                builder,
+                common_attn_metadata,
+                block_table,
+                slot_mapping,
+                for_cudagraph_capture,
+                **kwargs,
+            )
+            for builder, block_table, slot_mapping in zip(
+                builders, block_tables, slot_mappings, strict=True
+            )
+        ]
+
     def build_for_cudagraph_capture(
         self, common_attn_metadata: CommonAttentionMetadata
     ) -> M:
@@ -773,6 +803,29 @@ class AttentionMetadataBuilder(ABC, Generic[M]):
         tensors that ``metadata`` already references.
         """
         raise NotImplementedError
+
+
+def build_group(
+    builder: AttentionMetadataBuilder[M],
+    common_attn_metadata: CommonAttentionMetadata,
+    block_table: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    for_cudagraph_capture: bool = False,
+    **kwargs: Any,
+) -> M:
+    """Build one group's metadata on its own, as ``build_grouped`` does for
+    every group by default."""
+    common = common_attn_metadata
+    if (
+        block_table is not common.block_table_tensor
+        or slot_mapping is not common.slot_mapping
+    ):
+        common = replace(
+            common, block_table_tensor=block_table, slot_mapping=slot_mapping
+        )
+    if for_cudagraph_capture:
+        return builder.build_for_cudagraph_capture(common)
+    return builder.build(0, common, **kwargs)
 
 
 class AttentionLayer(Protocol):

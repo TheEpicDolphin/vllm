@@ -102,9 +102,11 @@ def test_pcp_draft_metadata_keeps_graph_padding_in_decode(cg_mode):
         [
             SimpleNamespace(
                 get_metadata_builder=lambda _: SimpleNamespace(
-                    build=build, supports_update_block_table=False
+                    build_grouped=lambda cm, *_, **__: [build(0, cm)]
                 ),
-                build_metadata=lambda cm, ubatch_idx=0, **_: build(0, cm),
+                kv_cache_spec=None,
+                kernel_block_size=None,
+                map_to_kernel_block_table=lambda block_table, _: block_table,
                 layer_names=["draft"],
             )
         ]
