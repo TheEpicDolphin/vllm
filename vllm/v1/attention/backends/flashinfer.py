@@ -428,6 +428,21 @@ class BatchDCPPrefillWrapper:
         return out
 
 
+def _kernel_block_sizes(num_qo_heads: int, num_kv_heads: int) -> list[int | MultipleOf]:
+    # Page sizes >= 128 only run on the trtllm-gen dynamic kernel (GQA/MQA
+    # on Blackwell); advertise them only when usable so selection never
+    # picks a large kernel block we cannot serve.
+    use_large_pages = (
+        num_kv_heads > 0
+        and num_qo_heads // num_kv_heads > 1
+        and current_platform.is_device_capability_family(100)
+        and can_use_trtllm_attention(num_qo_heads, num_kv_heads)
+    )
+    if not use_large_pages:
+        return [16, 32, 64]
+    return [16, 32, 64, 128, 256, 512, 1024]
+
+
 class FlashInferBackend(AttentionBackend):
     @classmethod
     def customize_spec(cls, spec: "AttentionSpec") -> "AttentionSpec":
@@ -458,25 +473,29 @@ class FlashInferBackend(AttentionBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
-        # Page sizes >= 128 only run on the trtllm-gen dynamic kernel (GQA/MQA
-        # on Blackwell); advertise them only when usable so selection never
-        # picks a large kernel block we cannot serve.
-        use_large_pages = False
         vllm_config = get_current_vllm_config_or_none()
-        if vllm_config is not None and vllm_config.model_config is not None:
-            pc = vllm_config.parallel_config
-            mc = vllm_config.model_config
-            num_qo_heads = mc.get_num_attention_heads(pc)
-            num_kv_heads = mc.get_num_kv_heads(pc)
-            use_large_pages = (
-                num_kv_heads > 0
-                and num_qo_heads // num_kv_heads > 1
-                and current_platform.is_device_capability_family(100)
-                and can_use_trtllm_attention(num_qo_heads, num_kv_heads)
-            )
-        if not use_large_pages:
-            return [16, 32, 64]
-        return [16, 32, 64, 128, 256, 512, 1024]
+        if vllm_config is None or vllm_config.model_config is None:
+            return _kernel_block_sizes(0, 0)
+        pc = vllm_config.parallel_config
+        mc = vllm_config.model_config
+        return _kernel_block_sizes(
+            mc.get_num_attention_heads(pc), mc.get_num_kv_heads(pc)
+        )
+
+    @classmethod
+    def get_supported_kernel_block_sizes_for_layers(
+        cls,
+        kv_cache_spec: KVCacheSpec | None,
+        layer_names: list[str],
+    ) -> list[int | MultipleOf]:
+        # Size from the layers' own heads, as the metadata builder does: a
+        # draft's head layout can differ from the target's.
+        vllm_config = get_current_vllm_config_or_none()
+        if vllm_config is not None and isinstance(kv_cache_spec, AttentionSpec):
+            num_qo_heads = get_num_attention_heads_from_layers(vllm_config, layer_names)
+            if num_qo_heads is not None:
+                return _kernel_block_sizes(num_qo_heads, kv_cache_spec.num_kv_heads)
+        return cls.get_supported_kernel_block_sizes(kv_cache_spec)
 
     @staticmethod
     def get_name() -> str:
@@ -1044,31 +1063,27 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             return AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
 
         kv_specs = iter_layer_specs(kv_cache_spec)
-        num_qo_heads = vllm_config.model_config.get_num_attention_heads(
-            vllm_config.parallel_config
-        )
         is_xqa_arch = current_platform.is_device_capability(
             90
         ) or current_platform.is_device_capability_family(120)
-        has_uniform_batch_support: bool = len(kv_specs) > 0
+        # Every layer's query heads are a multiple of its KV heads, so only
+        # platform support decides trtllm-gen/XQA decode here.
+        has_uniform_batch_support: bool = (
+            len(kv_specs) > 0
+            and force_use_trtllm_attention() is not False
+            and supports_trtllm_attention(is_prefill=False)
+        )
         for spec in kv_specs:
             if not isinstance(spec, AttentionSpec):
                 # FlashInfer only applies to attention, so we don't consider other types
                 # of KV spec (e.g. Mamba) here. This is mostly for type checking.
                 continue
-            if not can_use_trtllm_attention(
-                num_qo_heads=num_qo_heads,
-                num_kv_heads=spec.num_kv_heads,
-                is_prefill=False,
-            ) or (
-                is_xqa_arch
-                and (
-                    (
-                        spec.kv_quant_mode.is_nvfp4
-                        and not current_platform.is_device_capability_family(120)
-                    )
-                    or not _is_xqa_head_dim_supported(spec.head_size)
+            if is_xqa_arch and (
+                (
+                    spec.kv_quant_mode.is_nvfp4
+                    and not current_platform.is_device_capability_family(120)
                 )
+                or not _is_xqa_head_dim_supported(spec.head_size)
             ):
                 has_uniform_batch_support = False
                 break
@@ -1086,8 +1101,8 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         vllm_config: VllmConfig,
         kv_cache_spec: KVCacheSpec,
     ) -> int | None:
-        # The uniform gate already covers DCP, head geometry, the XQA head-dim
-        # limit and causality, and yields None for subclasses that force NEVER.
+        # The uniform gate already covers DCP, the XQA head-dim limit and
+        # causality, and yields None for subclasses that force NEVER.
         if (
             cls.get_cudagraph_support(vllm_config, kv_cache_spec)
             != AttentionCGSupport.UNIFORM_BATCH
