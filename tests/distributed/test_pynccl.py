@@ -247,6 +247,51 @@ def test_cuda_communicator_all_gather_dim_not_zero():
 
 
 @worker_fn_wrapper
+def all_to_all_worker_fn():
+    pynccl_comm = PyNcclCommunicator(
+        get_world_group().cpu_group, device=get_world_group().device
+    )
+    rank = pynccl_comm.rank
+    world_size = pynccl_comm.world_size
+    device = f"cuda:{rank}"
+
+    # Chunk d of rank r's input carries r * 100 + d and goes to rank d.
+    rows_per_chunk = 3
+    send = torch.tensor(
+        [rank * 100 + dst for dst in range(world_size)], dtype=torch.float32
+    )
+    send = send.repeat_interleave(rows_per_chunk).view(-1, 1).expand(-1, 8)
+    send = send.contiguous().to(device)
+    recv = torch.empty_like(send)
+    expected = torch.tensor(
+        [src * 100 + rank for src in range(world_size)], dtype=torch.float32
+    )
+    expected = expected.repeat_interleave(rows_per_chunk).view(-1, 1).expand(-1, 8)
+    expected = expected.to(device)
+
+    pynccl_comm.all_to_all(recv, send)
+    torch.accelerator.synchronize()
+    torch.testing.assert_close(recv, expected, rtol=0, atol=0)
+
+    # Uniform splits are fixed by the shapes, so the collective replays from
+    # a CUDA graph with fresh inputs.
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        pynccl_comm.all_to_all(recv, send)
+    send.add_(1000)
+    graph.replay()
+    torch.accelerator.synchronize()
+    torch.testing.assert_close(recv, expected + 1000, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(
+    torch.accelerator.device_count() < 2, reason="Need at least 2 GPUs to run the test."
+)
+def test_pynccl_all_to_all():
+    distributed_run(all_to_all_worker_fn, 2)
+
+
+@worker_fn_wrapper
 def all_gatherv_worker_fn():
     pynccl_comm = PyNcclCommunicator(
         get_world_group().cpu_group, device=get_world_group().device

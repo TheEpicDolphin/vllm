@@ -668,3 +668,36 @@ def test_finish_requests_frees_slots_in_sorted_order():
     GPUModelRunner.finish_requests(fake_runner, scheduler_output)
     assert removed == sorted(removed)
     assert set(removed) == {"req-a", "req-b", "req-c", "req-d", "req-e"}
+
+
+@requires_cuda
+@pytest.mark.parametrize("tp_size", [2, 4])
+@pytest.mark.parametrize("seed", [0, 1])
+def test_fixed_shard_plan_round_trip(tp_size: int, seed: int):
+    """Each real request takes one slot of its owner's fixed-size block, in
+    batch order; padding lanes (-1) take none; and the gather indices restore
+    batch order from the all-gathered blocks."""
+    rng = np.random.default_rng(seed)
+    max_num_reqs = 64
+    num_reqs, num_padding = 37, 11
+    slots = rng.choice(max_num_reqs, size=num_reqs, replace=False)
+    idx_mapping = np.concatenate([slots, np.full(num_padding, -1)])
+    capacity = batch_shard.max_num_reqs_per_rank(slots, tp_size)
+    send_reqs, gathered_src_indices = batch_shard.build_fixed_shard_plan(
+        torch.from_numpy(idx_mapping).to(DEVICE),
+        capacity,
+        tp_size,
+        padded_num_reqs=64,
+    )
+
+    blocks = _np(send_reqs).reshape(tp_size, capacity)
+    for rank in range(tp_size):
+        owned = np.flatnonzero(slots % tp_size == rank)
+        assert blocks[rank, : len(owned)].tolist() == owned.tolist()
+        assert (blocks[rank, len(owned) :] == -1).all()
+
+    # Each owner publishes its requests' batch indices; the gather must
+    # return every request its own.
+    gathered = blocks.reshape(-1)
+    restored = gathered[_np(gathered_src_indices)[:num_reqs]]
+    assert restored.tolist() == list(range(num_reqs))

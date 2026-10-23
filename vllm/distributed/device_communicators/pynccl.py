@@ -486,6 +486,35 @@ class PyNcclCommunicator:
             self.recv(output_tensor, root, stream)
         self.nccl.ncclGroupEnd()
 
+    def all_to_all(
+        self,
+        output_tensor: torch.Tensor,
+        input_tensor: torch.Tensor,
+        stream=None,
+    ):
+        """Uniform-split all-to-all along dim 0: chunk i of ``input_tensor``
+        goes to rank i, and chunk i of ``output_tensor`` comes from rank i.
+        The split sizes are fixed by the shapes, so it is CUDA graph capturable.
+        """
+        if self.disabled:
+            return
+        assert input_tensor.device == self.device, (
+            f"this nccl communicator is created to work on {self.device}, "
+            f"but the input tensor is on {input_tensor.device}"
+        )
+        assert output_tensor.shape == input_tensor.shape
+        assert input_tensor.shape[0] % self.world_size == 0
+        assert input_tensor.is_contiguous() and output_tensor.is_contiguous()
+        if stream is None:
+            stream = current_stream()
+        inputs = input_tensor.chunk(self.world_size)
+        outputs = output_tensor.chunk(self.world_size)
+        self.nccl.ncclGroupStart()
+        for peer in range(self.world_size):
+            self.send(inputs[peer], peer, stream)
+            self.recv(outputs[peer], peer, stream)
+        self.nccl.ncclGroupEnd()
+
     def send(self, tensor: torch.Tensor, dst: int, stream=None):
         if self.disabled:
             return

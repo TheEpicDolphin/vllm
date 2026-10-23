@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import copy
+from collections.abc import Callable
 from typing import Any
 
 import torch
@@ -20,6 +21,7 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.cp_utils import cp_local_slot
+from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.dp_utils import DPSyncState, dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
@@ -168,15 +170,27 @@ class DFlashSpeculator(DraftModelSpeculator):
 
     def capture(self) -> None:
         logger.info("Capturing model for %s speculator...", self._speculator_name)
+        assert self.query_cudagraph_manager is not None
+        self._capture_graphs(
+            self.query_cudagraph_manager,
+            self._generate_draft,
+            f"Capturing {self._speculator_name.lower()} CUDA graphs",
+        )
+
+    def _capture_graphs(
+        self,
+        manager: DFlashCudaGraphManager,
+        generate_draft: Callable[..., None],
+        progress_bar_desc: str,
+    ) -> None:
         # Padded sample rows must not scatter into a live request during capture.
         self.sample_indices.zero_()
         self.sample_pos.zero_()
         self.sample_idx_mapping.fill_(-1)
         # Capture must not write context K/V.
         self._context_slot_mappings.fill_(PAD_SLOT_ID)
-        assert self.query_cudagraph_manager is not None
-        self.query_cudagraph_manager.capture(
-            self._generate_draft,
+        manager.capture(
+            generate_draft,
             self.input_buffers,
             self.block_tables,
             self.attn_groups,
@@ -184,7 +198,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             self.max_model_len,
             causal=self._group_causal,
             prepare_forward=self._prepare_graph_forward,
-            progress_bar_desc=f"Capturing {self._speculator_name.lower()} CUDA graphs",
+            progress_bar_desc=progress_bar_desc,
         )
 
     def _prepare_graph_forward(
@@ -371,6 +385,12 @@ class DFlashSpeculator(DraftModelSpeculator):
         self.draft_tokens[:num_reqs] = draft_tokens.view(
             num_reqs, self.num_speculative_steps
         )
+
+    def _run_fullgraph(
+        self, batch_desc: BatchExecutionDescriptor, input_batch: InputBatch
+    ) -> None:
+        assert self.query_cudagraph_manager is not None
+        self.query_cudagraph_manager.run_fullgraph(batch_desc)
 
     def _num_graph_context_tokens(self, num_reqs: int) -> int:
         # Context rows a captured draft step stores: one full verify per request.
@@ -606,8 +626,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         self._prepare_eplb_forward(num_query_tokens)
 
         if is_full_cudagraph:
-            assert self.query_cudagraph_manager is not None
-            self.query_cudagraph_manager.run_fullgraph(batch_desc)
+            self._run_fullgraph(batch_desc, input_batch)
         else:
             draft_slot_mappings_by_layer = build_slot_mappings_by_layer(
                 self.block_tables.slot_mappings[:, :num_tokens_padded],

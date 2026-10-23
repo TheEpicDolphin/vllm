@@ -1600,3 +1600,122 @@ def test_watermarked_recovery_is_unchanged_by_fp64_gumbel():
         rtol=0,
         atol=0,
     )
+
+
+@pytest.mark.parametrize("tp_size", [2, 4])
+@pytest.mark.parametrize("use_block_verification", [False, True])
+def test_sharded_draft_logits_verify_like_replicated(
+    tp_size: int, use_block_verification: bool
+):
+    """A rank that caches only its owned requests' draft logits (at row
+    req_state_idx // tp_size) verifies those requests exactly like the
+    replicated cache does."""
+    torch.manual_seed(0)
+    device = "cuda"
+    num_reqs = 12
+    num_speculative_steps = 3
+    vocab_size = 1000
+    num_rows = num_speculative_steps + 1
+    inputs = _build_rejection_sample_inputs(
+        torch.zeros(vocab_size, device=device),
+        torch.zeros(vocab_size, device=device),
+        num_speculative_steps,
+        temperature=1.0,
+        num_trials=num_reqs,
+    )
+    # Per-request distributions, close enough that some drafts are accepted.
+    draft_logits = torch.randn(
+        num_reqs, num_speculative_steps, vocab_size, device=device
+    )
+    target_logits = torch.randn(num_reqs, num_rows, vocab_size, device=device)
+    target_logits[:, :num_speculative_steps] = draft_logits + 0.5 * torch.randn_like(
+        draft_logits
+    )
+    inputs["target_logits"] = target_logits.view(-1, vocab_size)
+    draft_tokens = torch.multinomial(
+        torch.softmax(draft_logits.view(-1, vocab_size), dim=-1), 1
+    ).view(num_reqs, num_speculative_steps)
+    inputs["draft_sampled"].view(num_reqs, num_rows)[:, 1:] = draft_tokens
+    # Shuffle request slots so ownership and cache rows aren't batch order.
+    slots = torch.randperm(num_reqs, device=device).to(torch.int32)
+    inputs["idx_mapping"] = slots
+    inputs["expanded_idx_mapping"] = slots.repeat_interleave(num_rows)
+    inputs["draft_logits"] = torch.empty_like(draft_logits)
+    inputs["draft_logits"][slots.long()] = draft_logits
+
+    sampled, num_sampled = rejection_sample(
+        **inputs,
+        num_speculative_steps=num_speculative_steps,
+        use_block_verification=use_block_verification,
+    )
+    assert 1 < num_sampled.float().mean() < num_rows
+
+    for rank in range(tp_size):
+        owned = (slots % tp_size == rank).nonzero().view(-1)
+        rows = owned.view(-1, 1) * num_rows + torch.arange(num_rows, device=device)
+        rows = rows.view(-1)
+        local_inputs = dict(inputs)
+        for name in (
+            "target_logits",
+            "draft_sampled",
+            "pos",
+            "expanded_idx_mapping",
+            "expanded_local_pos",
+        ):
+            local_inputs[name] = inputs[name][rows]
+        local_inputs["idx_mapping"] = slots[owned]
+        local_inputs["cu_num_logits"] = inputs["cu_num_logits"][: len(owned) + 1]
+        local_inputs["draft_logits"] = inputs["draft_logits"][rank::tp_size]
+
+        local_sampled, local_num_sampled = rejection_sample(
+            **local_inputs,
+            num_speculative_steps=num_speculative_steps,
+            use_block_verification=use_block_verification,
+            draft_logits_tp_size=tp_size,
+        )
+        assert torch.equal(local_num_sampled, num_sampled[owned])
+        valid = torch.arange(num_rows, device=device) < local_num_sampled[:, None]
+        assert torch.equal(local_sampled[valid], sampled[owned][valid])
+
+
+@pytest.mark.parametrize("tp_size", [2, 4])
+def test_sharded_draft_logits_cache_writes(tp_size: int):
+    """gumbel_sample caches only the owned rows, at req_state_idx // tp_size,
+    without changing what it samples."""
+    torch.manual_seed(0)
+    device = "cuda"
+    max_num_reqs = 16
+    num_cols = 3
+    num_tokens = max_num_reqs * num_cols
+    idx_mapping = torch.randperm(max_num_reqs, device=device).repeat_interleave(
+        num_cols
+    )
+    # A CUDA graph padding row.
+    idx_mapping[-num_cols:] = -1
+    cols = torch.arange(num_cols, device=device, dtype=torch.int32).repeat(max_num_reqs)
+    logits = torch.randn(num_tokens, VOCAB_SIZE, device=device)
+    kwargs = dict(
+        expanded_idx_mapping=idx_mapping,
+        temperature=torch.ones(max_num_reqs, device=device),
+        seed=torch.arange(max_num_reqs, device=device),
+        pos=torch.arange(num_tokens, device=device),
+        apply_temperature=True,
+        is_drafting=True,
+        logits_cache_col=cols,
+    )
+    cache = torch.zeros(max_num_reqs, num_cols, VOCAB_SIZE, device=device)
+    sampled = gumbel_sample(logits, logits_cache=cache, **kwargs)
+
+    for rank in range(tp_size):
+        local_cache = torch.zeros(max_num_reqs // tp_size, num_cols, VOCAB_SIZE).to(
+            device
+        )
+        local_sampled = gumbel_sample(
+            logits,
+            logits_cache=local_cache,
+            logits_cache_tp_size=tp_size,
+            logits_cache_tp_rank=rank,
+            **kwargs,
+        )
+        assert torch.equal(local_sampled, sampled)
+        assert torch.equal(local_cache, cache[rank::tp_size])

@@ -48,6 +48,15 @@ class BatchShardMetadata:
     adaptive_verification_enabled: bool
 
 
+@triton.jit
+def shard_owner(req_state_idx, TP_SIZE: tl.constexpr):
+    """TP rank that samples a request and holds its draft logits.
+
+    Mirrored on the host as ``idx_mapping_np % tp_size``.
+    """
+    return req_state_idx % TP_SIZE
+
+
 @triton.jit(
     do_not_specialize=["num_reqs", "local_logits_start", "max_num_reqs_per_rank"]
 )
@@ -74,14 +83,16 @@ def _build_shard_plan_kernel(
 ):
     req_idx = tl.program_id(0)
     req_state_idx = tl.load(idx_mapping_ptr + req_idx)
-    owner = req_state_idx % TP_SIZE
+    owner = shard_owner(req_state_idx, TP_SIZE)
     num_logits = tl.load(cu_num_logits_ptr + req_idx + 1) - tl.load(
         cu_num_logits_ptr + req_idx
     )
 
     req_block = tl.arange(0, PADDED_NUM_REQS)
     req_mask = req_block < num_reqs
-    owners = tl.load(idx_mapping_ptr + req_block, mask=req_mask, other=0) % TP_SIZE
+    owners = shard_owner(
+        tl.load(idx_mapping_ptr + req_block, mask=req_mask, other=0), TP_SIZE
+    )
     num_logits_per_req = tl.load(
         cu_num_logits_ptr + req_block + 1, mask=req_mask, other=0
     ) - tl.load(cu_num_logits_ptr + req_block, mask=req_mask, other=0)
@@ -311,6 +322,88 @@ class BatchSharder:
             adaptive_verification_enabled=self.adaptive_verification_enabled,
         )
         return local_batch, sorted_logits_indices, local_grammar_output, metadata
+
+
+@triton.jit(do_not_specialize=["num_reqs", "capacity"])
+def _build_fixed_shard_plan_kernel(
+    idx_mapping_ptr,
+    send_reqs_ptr,
+    gathered_src_indices_ptr,
+    num_reqs,
+    capacity,
+    TP_SIZE: tl.constexpr,
+    PADDED_NUM_REQS: tl.constexpr,
+):
+    req_idx = tl.program_id(0)
+    req_state_idx = tl.load(idx_mapping_ptr + req_idx)
+    if req_state_idx < 0:
+        # A CUDA graph padding lane. Point it at a valid gathered row; its
+        # result is never used.
+        tl.store(gathered_src_indices_ptr + req_idx, 0)
+        return
+    owner = shard_owner(req_state_idx, TP_SIZE)
+    req_block = tl.arange(0, PADDED_NUM_REQS)
+    req_mask = req_block < num_reqs
+    req_state_block = tl.load(idx_mapping_ptr + req_block, mask=req_mask, other=-1)
+    earlier = (
+        (req_state_block >= 0)
+        & (shard_owner(req_state_block, TP_SIZE) == owner)
+        & (req_block < req_idx)
+    )
+    offset = tl.sum(earlier.to(tl.int32))
+    # The host checks the capacity before dispatching a sharded step. The
+    # guard only keeps an overflow from writing out of bounds.
+    if offset < capacity:
+        dst = owner * capacity + offset
+        tl.store(send_reqs_ptr + dst, req_idx)
+        tl.store(gathered_src_indices_ptr + req_idx, dst.to(tl.int64))
+
+
+def build_fixed_shard_plan(
+    idx_mapping: torch.Tensor,
+    capacity: int,
+    tp_size: int,
+    padded_num_reqs: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """CUDA graph-safe shard plan with a fixed number of requests per rank.
+
+    Unlike `BatchSharder.shard_sampler_inputs`, every shape here depends only
+    on ``idx_mapping.shape[0]`` and ``capacity``, and the plan is built on the
+    device, so it can be captured. Entries of ``idx_mapping`` equal to -1 are
+    padding and are owned by no rank.
+
+    Returns:
+        send_reqs: [tp_size * capacity] the batch index of the j-th request
+            owned by rank r at r * capacity + j, or -1 for an empty slot.
+        gathered_src_indices: [num_reqs] the row of each request in a
+            [tp_size * capacity] tensor all-gathered from the owners.
+
+    """
+    num_reqs = idx_mapping.shape[0]
+    send_reqs = torch.full(
+        (tp_size * capacity,), -1, dtype=torch.int64, device=idx_mapping.device
+    )
+    gathered_src_indices = torch.empty(
+        num_reqs, dtype=torch.int64, device=idx_mapping.device
+    )
+    if num_reqs > 0:
+        _build_fixed_shard_plan_kernel[(num_reqs,)](
+            idx_mapping,
+            send_reqs,
+            gathered_src_indices,
+            num_reqs,
+            capacity,
+            TP_SIZE=tp_size,
+            PADDED_NUM_REQS=padded_num_reqs,
+        )
+    return send_reqs, gathered_src_indices
+
+
+def max_num_reqs_per_rank(idx_mapping_np: np.ndarray, tp_size: int) -> int:
+    """The most requests owned by one rank (host mirror of `shard_owner`)."""
+    if idx_mapping_np.shape[0] == 0:
+        return 0
+    return int(np.bincount(idx_mapping_np % tp_size, minlength=tp_size).max())
 
 
 def all_to_all_logits(

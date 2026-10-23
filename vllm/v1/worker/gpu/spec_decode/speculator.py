@@ -16,6 +16,7 @@ from vllm.distributed.eplb.eplb_state import EplbState
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.models import supports_multimodal_embeddings
+from vllm.utils.math_utils import cdiv
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.watermarking import create_watermarker
 from vllm.v1.watermarking.spec_decode import (
@@ -191,6 +192,11 @@ class DraftModelSpeculator(BaseSpeculator):
                 dtype=dtype,
                 device=device,
             )
+        # Under batch-sharded sampling, rank r caches only the draft logits of
+        # the requests it owns, at row req_state_idx // draft_logits_tp_size.
+        # See enable_batch_sharded_sampling.
+        self.draft_logits_tp_size = 1
+        self.draft_logits_tp_rank = 0
 
         self.draft_watermarker: DraftWatermarker | None = None
         watermark_config = getattr(vllm_config, "watermark_config", None)
@@ -261,6 +267,42 @@ class DraftModelSpeculator(BaseSpeculator):
                 self.num_speculative_steps,
                 self.device,
             )
+
+    def supports_sharded_draft_logits(self) -> bool:
+        """Whether every draft logits write on this speculator's path honors
+        draft_logits_tp_size and draft_logits_tp_rank."""
+        return False
+
+    def enable_batch_sharded_sampling(self, tp_size: int, tp_rank: int) -> bool:
+        """Called when the target's sampling is batch-sharded across TP ranks.
+
+        The rank that verifies a request is the only one that reads its draft
+        logits, so each rank keeps just the rows of the requests it owns.
+
+        Returns:
+            Whether the draft logits are sharded. The rejection sampler must
+            then index them by owner row.
+
+        """
+        if (
+            tp_size == 1
+            or self.draft_logits is None
+            or self.draft_watermarker is not None
+            or not self.supports_sharded_draft_logits()
+        ):
+            return False
+        _, fill = self.draft_logits_spec(self.vllm_config)
+        self.draft_logits = self.draft_logits.new_full(
+            (cdiv(self.max_num_reqs, tp_size), *self.draft_logits.shape[1:]), fill
+        )
+        self.draft_logits_tp_size = tp_size
+        self.draft_logits_tp_rank = tp_rank
+        logger.info(
+            "Sharding the draft logits cache across %d TP ranks (%.2f GiB per rank).",
+            tp_size,
+            self.draft_logits.nbytes / 2**30,
+        )
+        return True
 
     def set_eplb_state(self, eplb_state: EplbState) -> None:
         """Inject EPLB state after construction."""

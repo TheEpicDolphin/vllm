@@ -523,6 +523,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         self.vllm_config.watermark_config
                     ),
                 )
+                # Verification is batch-sharded, so only a request's owner rank
+                # reads its draft logits.
+                if (
+                    self.batch_sharder is not None
+                    and isinstance(self.speculator, DraftModelSpeculator)
+                    and self.speculator.enable_batch_sharded_sampling(
+                        self.batch_sharder.tp_size, self.batch_sharder.tp_rank
+                    )
+                ):
+                    self.rejection_sampler.draft_logits_tp_size = (
+                        self.batch_sharder.tp_size
+                    )
             self.prompt_logprobs_worker = PromptLogprobsWorker(
                 self.max_num_reqs,
                 self.device,
