@@ -19,6 +19,7 @@ from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 
 if TYPE_CHECKING:
+    from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
     from vllm.v1.worker.gpu.spec_decode.draft_logits import DraftLogitsCache
 
 
@@ -217,6 +218,21 @@ class BatchSharder:
         self._padded_num_reqs = triton.next_power_of_2(max_num_reqs)
         self._padded_num_logits_per_req = triton.next_power_of_2(max_num_logits_per_req)
         self._num_warps = max(1, min(8, self._padded_num_reqs // 128))
+        # Persistent shard plan outputs, keyed by name and dtype. Every step
+        # consumes its plan on the current stream before the next step
+        # rebuilds it, so the buffers can be reused instead of reallocated.
+        self._max_num_plan_elems = max_num_reqs * max_num_logits_per_req + 1
+        self._plan_buffers: dict[tuple[str, torch.dtype], torch.Tensor] = {}
+
+    def _plan_buffer(self, name: str, dtype: torch.dtype, n: int) -> torch.Tensor:
+        key = (name, dtype)
+        buffer = self._plan_buffers.get(key)
+        if buffer is None:
+            buffer = torch.empty(
+                self._max_num_plan_elems, dtype=dtype, device=self.device
+            )
+            self._plan_buffers[key] = buffer
+        return buffer[:n]
 
     def shard_sampler_inputs(
         self,
@@ -276,29 +292,34 @@ class BatchSharder:
             num_logits_per_req_np[local_req_indices_np], out=local_cu_num_logits_np[1:]
         )
         max_num_logits_per_req = int(num_logits_per_req_np.max()) if num_reqs else 1
-        local_seq_lens_cpu_upper_bound = input_batch.seq_lens_cpu_upper_bound[
-            torch.from_numpy(local_req_indices_np)
-        ]
+        local_seq_lens_cpu_upper_bound = torch.from_numpy(
+            input_batch.seq_lens_cpu_upper_bound.numpy()[local_req_indices_np]
+        )
 
         # Shard the input batch GPU tensors.
-        sorted_logits_indices = torch.empty(
-            num_logits, dtype=torch.int64, device=self.device
+        buffer = self._plan_buffer
+        sorted_logits_indices = buffer("sorted_logits_indices", torch.int64, num_logits)
+        gathered_src_indices = buffer("gathered_src_indices", torch.int64, num_reqs)
+        local_logits_indices = buffer(
+            "local_logits_indices", torch.int64, num_local_logits
         )
-        gathered_src_indices = torch.empty(
-            num_reqs, dtype=torch.int64, device=self.device
+        local_idx_mapping = buffer(
+            "idx_mapping", input_batch.idx_mapping.dtype, num_local_reqs
         )
-        local_logits_indices = torch.empty(
-            num_local_logits, dtype=torch.int64, device=self.device
+        local_cu_num_logits = buffer(
+            "cu_num_logits", input_batch.cu_num_logits.dtype, num_local_reqs + 1
         )
-        local_idx_mapping = input_batch.idx_mapping.new_empty(num_local_reqs)
-        local_cu_num_logits = input_batch.cu_num_logits.new_empty(num_local_reqs + 1)
-        local_expanded_idx_mapping = input_batch.expanded_idx_mapping.new_empty(
-            num_local_logits
+        local_expanded_idx_mapping = buffer(
+            "expanded_idx_mapping",
+            input_batch.expanded_idx_mapping.dtype,
+            num_local_logits,
         )
-        local_expanded_local_pos = input_batch.expanded_local_pos.new_empty(
-            num_local_logits
+        local_expanded_local_pos = buffer(
+            "expanded_local_pos",
+            input_batch.expanded_local_pos.dtype,
+            num_local_logits,
         )
-        local_seq_lens = input_batch.seq_lens.new_empty(num_local_reqs)
+        local_seq_lens = buffer("seq_lens", input_batch.seq_lens.dtype, num_local_reqs)
         if num_reqs > 0:
             _build_shard_plan_kernel[(num_reqs,)](
                 input_batch.idx_mapping,
@@ -374,6 +395,12 @@ class BatchSharder:
         return local_batch, sorted_logits_indices, local_grammar_output, metadata
 
 
+def _tp_pynccl() -> "PyNcclCommunicator | None":
+    """The TP group's PyNCCL communicator, or None if it is unavailable."""
+    pynccl = getattr(get_tp_group().device_communicator, "pynccl_comm", None)
+    return None if pynccl is None or pynccl.disabled else pynccl
+
+
 def all_to_all_logits(
     logits_shard: torch.Tensor,
     metadata: BatchShardMetadata,
@@ -381,13 +408,25 @@ def all_to_all_logits(
     recv = logits_shard.new_empty(
         metadata.tp_size * metadata.num_local_logits, logits_shard.shape[-1]
     )
-    torch.distributed.all_to_all_single(
-        recv,
-        logits_shard.contiguous(),
-        output_split_sizes=[metadata.num_local_logits] * metadata.tp_size,
-        input_split_sizes=metadata.num_logits_per_rank,
-        group=get_tp_group().device_group,
-    )
+    output_split_sizes = [metadata.num_local_logits] * metadata.tp_size
+    pynccl = _tp_pynccl()
+    if pynccl is not None:
+        # The TP collectives' communicator: a c10d all-to-all would make NCCL
+        # allocate a second set of point-to-point buffers.
+        pynccl.all_to_all_single(
+            recv,
+            logits_shard.contiguous(),
+            output_split_sizes,
+            metadata.num_logits_per_rank,
+        )
+    else:
+        torch.distributed.all_to_all_single(
+            recv,
+            logits_shard.contiguous(),
+            output_split_sizes=output_split_sizes,
+            input_split_sizes=metadata.num_logits_per_rank,
+            group=get_tp_group().device_group,
+        )
     shard_width = recv.shape[-1]
     return (
         recv.view(metadata.tp_size, metadata.num_local_logits, shard_width)
@@ -718,8 +757,14 @@ def gather_sampler_output(
             BLOCK_SIZE=block_size,
         )
 
-    # All-gather the sampler output tensors (excluding logprobs).
-    gathered = tensor_model_parallel_all_gather(packed, dim=0)
+    # All-gather the sampler output tensors (excluding logprobs). Calling
+    # PyNCCL directly skips the custom op dispatch on this per-step path.
+    pynccl = _tp_pynccl()
+    if pynccl is not None:
+        gathered = packed.new_empty(metadata.tp_size * packed.shape[0], num_packed_cols)
+        pynccl.all_gather(gathered, packed)
+    else:
+        gathered = tensor_model_parallel_all_gather(packed, dim=0)
     # All-gather the logprobs tensors.
     logprobs_tensors = None
     if logprobs_dims is not None:

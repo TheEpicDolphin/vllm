@@ -499,8 +499,11 @@ def test_gather_sampler_output_kernels(tp_size: int):
                 tp_size * x.shape[0], x.shape[1], dtype=x.dtype, device=x.device
             )
 
-        with mock.patch.object(
-            batch_shard, "tensor_model_parallel_all_gather", fake_all_gather
+        with (
+            mock.patch.object(batch_shard, "_tp_pynccl", return_value=None),
+            mock.patch.object(
+                batch_shard, "tensor_model_parallel_all_gather", fake_all_gather
+            ),
         ):
             return batch_shard.gather_sampler_output(
                 local_outputs[rank],
@@ -628,8 +631,11 @@ def test_gather_sampler_output_logprobs_and_nans():
                 tp_size * x.shape[0], *x.shape[1:], dtype=x.dtype, device=x.device
             )
 
-        with mock.patch.object(
-            batch_shard, "tensor_model_parallel_all_gather", fake_all_gather
+        with (
+            mock.patch.object(batch_shard, "_tp_pynccl", return_value=None),
+            mock.patch.object(
+                batch_shard, "tensor_model_parallel_all_gather", fake_all_gather
+            ),
         ):
             return batch_shard.gather_sampler_output(
                 local_outputs[rank],
